@@ -8959,7 +8959,6 @@ mod tests {
                                 ]),
                                 ..Default::default()
                             }),
-                            repo_path: Some("/repo".to_owned()),
                             parsed_target_patterns: Some(buck2_data::ParsedTargetPatterns {
                                 target_patterns: vec![buck2_data::TargetPattern {
                                     value: "//:buck2".to_owned(),
@@ -9515,7 +9514,7 @@ mod tests {
             4,
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
-                    data: Some(buck2_data::span_end_event::Data::TestRun(
+                    data: Some(buck2_data::span_end_event::Data::TestEnd(
                         buck2_data::TestRunEnd {
                             suite: Some(buck2_data::TestSuite {
                                 suite_name: "suite".to_owned(),
@@ -9944,7 +9943,7 @@ mod tests {
             5,
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
-                    data: Some(buck2_data::span_end_event::Data::TestRun(
+                    data: Some(buck2_data::span_end_event::Data::TestEnd(
                         buck2_data::TestRunEnd {
                             suite: Some(buck2_data::TestSuite {
                                 suite_name: "suite".to_owned(),
@@ -10059,7 +10058,7 @@ mod tests {
             4,
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
-                    data: Some(buck2_data::span_end_event::Data::TestRun(
+                    data: Some(buck2_data::span_end_event::Data::TestEnd(
                         buck2_data::TestRunEnd {
                             suite: Some(buck2_data::TestSuite {
                                 suite_name: "suite".to_owned(),
@@ -10502,7 +10501,6 @@ mod tests {
                             buck2_data::LoadBuildFileEnd {
                                 module_id: module_id.to_owned(),
                                 target_count: Some(target_count),
-                                starlark_tick_count: Some(tick_count),
                                 ..Default::default()
                             },
                         )),
