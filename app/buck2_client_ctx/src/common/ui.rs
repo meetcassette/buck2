@@ -75,6 +75,30 @@ pub fn get_console_with_root(
     config: SuperConsoleConfig,
     health_check_display_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
 ) -> (Box<dyn EventSubscriber>, bool) {
+    get_console_with_root_and_bes_results_url(
+        trace_id,
+        console_type,
+        verbosity,
+        expect_spans,
+        timekeeper,
+        command_name,
+        config,
+        health_check_display_reports_receiver,
+        None,
+    )
+}
+
+pub(crate) fn get_console_with_root_and_bes_results_url(
+    trace_id: TraceId,
+    console_type: ConsoleType,
+    verbosity: Verbosity,
+    expect_spans: bool,
+    timekeeper: Timekeeper,
+    command_name: &str,
+    config: SuperConsoleConfig,
+    health_check_display_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
+    bes_results_url: Option<String>,
+) -> (Box<dyn EventSubscriber>, bool) {
     let result: buck2_error::Result<(Box<dyn EventSubscriber>, bool)> = match console_type {
         ConsoleType::Simple => Ok((
             Box::new(SimpleConsole::<NoopEventObserverExtra>::autodetect(
@@ -82,6 +106,7 @@ pub fn get_console_with_root(
                 verbosity,
                 expect_spans,
                 health_check_display_reports_receiver,
+                bes_results_url,
             )),
             false,
         )),
@@ -91,6 +116,7 @@ pub fn get_console_with_root(
                 verbosity,
                 expect_spans,
                 health_check_display_reports_receiver,
+                bes_results_url,
             )),
             false,
         )),
@@ -100,6 +126,7 @@ pub fn get_console_with_root(
                 verbosity,
                 expect_spans,
                 health_check_display_reports_receiver,
+                bes_results_url,
             )),
             false,
         )),
@@ -112,6 +139,7 @@ pub fn get_console_with_root(
             None,
             config,
             health_check_display_reports_receiver,
+            bes_results_url,
         )
         .map(|c| (Box::new(c) as Box<dyn EventSubscriber>, true)),
         ConsoleType::Auto => match StatefulSuperConsole::console_builder().build() {
@@ -124,6 +152,7 @@ pub fn get_console_with_root(
                 timekeeper,
                 config,
                 health_check_display_reports_receiver,
+                bes_results_url.clone(),
             )
             .map(|c| (Box::new(c) as Box<dyn EventSubscriber>, true)),
             _ => Ok((
@@ -132,6 +161,7 @@ pub fn get_console_with_root(
                     verbosity,
                     expect_spans,
                     health_check_display_reports_receiver,
+                    bes_results_url,
                 )),
                 false,
             )),
@@ -150,6 +180,7 @@ pub fn get_console_with_root(
                     verbosity,
                     expect_spans,
                     // Maybe refactor and set this.
+                    None,
                     None,
                 )),
                 false,
