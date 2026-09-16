@@ -316,7 +316,7 @@ fn should_send_event_data(
                     | Data::RemoteRequest(..)
                     | Data::ReUpload(..)
                     | Data::TestDiscovery(..)
-                    | Data::TestStart(..),
+                    | Data::TestRun(..),
                 ) if preserve_bazel_logs => true,
                 None => false,
                 _ => false,

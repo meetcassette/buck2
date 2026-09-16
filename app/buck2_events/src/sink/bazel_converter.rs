@@ -6268,6 +6268,7 @@ fn critical_path_entry_name(entry: &buck2_data::CriticalPathEntry2) -> String {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "action".to_owned()),
         Some(Entry::Analysis(_)) => "analysis".to_owned(),
+        Some(Entry::AnonAnalysis(_)) => "anon analysis".to_owned(),
         Some(Entry::DynamicAnalysis(_)) => "dynamic analysis".to_owned(),
         Some(Entry::Load(load)) => format!("load {}", load.package),
         Some(Entry::Listing(listing)) => format!("listing {}", listing.package),
@@ -6281,6 +6282,10 @@ fn critical_path_entry_name(entry: &buck2_data::CriticalPathEntry2) -> String {
             .as_ref()
             .map(|category| format!("waiting ({category})"))
             .unwrap_or_else(|| "waiting".to_owned()),
+        Some(Entry::PageIn(page_in)) => format!("page in {}", page_in.key_type),
+        Some(Entry::EnsureTransitiveSetProjection(_)) => {
+            "ensure transitive set projection".to_owned()
+        }
         None => "critical path entry".to_owned(),
     }
 }
@@ -10194,7 +10199,7 @@ mod tests {
             4,
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
-                    data: Some(buck2_data::span_end_event::Data::TestEnd(
+                    data: Some(buck2_data::span_end_event::Data::TestRun(Box::new(
                         buck2_data::TestRunEnd {
                             suite: Some(buck2_data::TestSuite {
                                 suite_name: "suite".to_owned(),
@@ -10623,7 +10628,7 @@ mod tests {
             5,
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
-                    data: Some(buck2_data::span_end_event::Data::TestEnd(
+                    data: Some(buck2_data::span_end_event::Data::TestRun(Box::new(
                         buck2_data::TestRunEnd {
                             suite: Some(buck2_data::TestSuite {
                                 suite_name: "suite".to_owned(),
@@ -10738,7 +10743,7 @@ mod tests {
             4,
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
-                    data: Some(buck2_data::span_end_event::Data::TestEnd(
+                    data: Some(buck2_data::span_end_event::Data::TestRun(Box::new(
                         buck2_data::TestRunEnd {
                             suite: Some(buck2_data::TestSuite {
                                 suite_name: "suite".to_owned(),

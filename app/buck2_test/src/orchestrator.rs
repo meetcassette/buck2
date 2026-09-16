@@ -354,6 +354,25 @@ impl OwnedTestInfo {
                 .any(|l| l == "static-listing"),
         }
     }
+
+    fn labels(&self) -> Vec<String> {
+        match self {
+            Self::External(info) => info
+                .as_ref()
+                .value()
+                .as_ref()
+                .labels()
+                .map(str::to_owned)
+                .collect(),
+            Self::Internal(info) => info
+                .as_ref()
+                .value()
+                .as_ref()
+                .labels()
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -994,7 +1013,12 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
     ) -> buck2_error::Result<()> {
         let test_target = self.session.get(test_target)?;
 
-        let test_info = Self::get_test_info(self.dice.dupe().deref_mut(), &test_target).await?;
+        let test_info = Self::get_test_info(
+            &mut self.dice.dupe().ctx(),
+            &test_target,
+            &self.internal_runner_config,
+        )
+        .await?;
         let labels = test_labels(&test_info);
 
         self.events.instant_event(TestDiscovery {
@@ -2645,8 +2669,8 @@ impl CommandExecutionTarget for TestTarget<'_> {
     }
 }
 
-fn test_labels(test_info: &FrozenExternalRunnerTestInfo) -> Vec<String> {
-    test_info.labels().map(str::to_owned).collect()
+fn test_labels(test_info: &OwnedTestInfo) -> Vec<String> {
+    test_info.labels()
 }
 
 fn test_timeout_proto(timeout: Option<Duration>) -> Option<prost_types::Duration> {
