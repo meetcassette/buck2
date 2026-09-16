@@ -101,6 +101,8 @@ use crate::request::*;
 use crate::response::*;
 
 const DEFAULT_MAX_TOTAL_BATCH_SIZE: usize = 4 * 1000 * 1000;
+const DEFAULT_REQUEST_METADATA_TOOL_NAME: &str = "buck2";
+const REQUEST_METADATA_HEADER: &str = "build.bazel.remote.execution.v2.requestmetadata-bin";
 
 fn tdigest_to(tdigest: &TDigest) -> Digest {
     Digest {
@@ -241,8 +243,23 @@ impl Compressor {
 
 pub struct REClientBuilder;
 
+fn request_metadata_tool_name_from_options(
+    opts: &Buck2OssReConfiguration,
+) -> anyhow::Result<String> {
+    let request_metadata_tool_name = opts
+        .request_metadata_tool_name
+        .clone()
+        .unwrap_or_else(|| DEFAULT_REQUEST_METADATA_TOOL_NAME.to_owned());
+    anyhow::ensure!(
+        !request_metadata_tool_name.is_empty(),
+        "`request_metadata_tool_name` must not be empty"
+    );
+    Ok(request_metadata_tool_name)
+}
+
 impl REClientBuilder {
     pub async fn build_and_connect(opts: &Buck2OssReConfiguration) -> anyhow::Result<REClient> {
+        let request_metadata_tool_name = request_metadata_tool_name_from_options(opts)?;
         // Create channel config once (reads TLS files)
         let channel_config = ChannelConfig::new(opts)
             .await
@@ -336,6 +353,7 @@ impl REClientBuilder {
                 cas_ttl_secs: opts.cas_ttl_secs.unwrap_or(3 * 60 * 60),
                 find_missing_blobs_batch_size: opts.find_missing_blobs_batch_size.unwrap_or(100),
             },
+            request_metadata_tool_name,
             capabilities,
             instance_name,
             bystream_compressor,
@@ -481,6 +499,8 @@ impl FindMissingCache {
 
 pub struct REClient {
     runtime_opts: RERuntimeOpts,
+    /// Tool name to report in RequestMetadata.tool_details.
+    request_metadata_tool_name: String,
     pool: ChannelPool,
     capabilities: RECapabilities,
     instance_name: InstanceName,
@@ -681,6 +701,7 @@ where
 impl REClient {
     fn new(
         runtime_opts: RERuntimeOpts,
+        request_metadata_tool_name: String,
         capabilities: RECapabilities,
         instance_name: InstanceName,
         bystream_compressor: Option<Compressor>,
@@ -693,6 +714,7 @@ impl REClient {
     ) -> Self {
         REClient {
             runtime_opts,
+            request_metadata_tool_name,
             pool,
             capabilities,
             instance_name,
@@ -716,7 +738,12 @@ impl REClient {
         request: ActionResultRequest,
     ) -> impl Future<Output = anyhow::Result<ActionResultResponse>> + Send + use<'a> {
         let action_digest = tdigest_to(&request.digest);
-        let headers = with_re_metadata((), metadata, self.runtime_opts.use_fbcode_metadata)
+        let headers = with_re_metadata(
+            (),
+            metadata,
+            self.runtime_opts.use_fbcode_metadata,
+            self.request_metadata_tool_name.as_str(),
+        )
             .into_parts()
             .0;
         async move {
@@ -751,7 +778,12 @@ impl REClient {
     ) -> impl Future<Output = anyhow::Result<WriteActionResultResponse>> + Send + use<'a> {
         let action_result = convert_t_action_result2(&request.action_result);
         let action_digest = request.action_digest.clone();
-        let headers = with_re_metadata((), metadata, self.runtime_opts.use_fbcode_metadata)
+        let headers = with_re_metadata(
+            (),
+            metadata,
+            self.runtime_opts.use_fbcode_metadata,
+            self.request_metadata_tool_name.as_str(),
+        )
             .into_parts()
             .0;
         async move {
@@ -811,6 +843,7 @@ impl REClient {
                     },
                     metadata,
                     self.runtime_opts.use_fbcode_metadata,
+                    self.request_metadata_tool_name.as_str(),
                 ))
                 .await?
                 .into_inner();
@@ -845,7 +878,6 @@ impl REClient {
                     OpResult::Response(any) => {
                         let execute_response_grpc: GExecuteResponse =
                             GExecuteResponse::decode(&any.value[..])?;
-
                         check_status(execute_response_grpc.status.unwrap_or_default())?;
 
                         let action_result = execute_response_grpc
@@ -922,7 +954,12 @@ impl REClient {
         metadata: &RemoteExecutionMetadata,
         request: UploadRequest,
     ) -> impl Future<Output = anyhow::Result<UploadResponse>> + Send + use<'a> {
-        let headers = with_re_metadata((), metadata, self.runtime_opts.use_fbcode_metadata)
+        let headers = with_re_metadata(
+            (),
+            metadata,
+            self.runtime_opts.use_fbcode_metadata,
+            self.request_metadata_tool_name.as_str(),
+        )
             .into_parts()
             .0;
         async move {
@@ -999,7 +1036,12 @@ impl REClient {
         metadata: &RemoteExecutionMetadata,
         request: DownloadRequest,
     ) -> impl Future<Output = anyhow::Result<DownloadResponse>> + Send + use<'a> {
-        let headers = with_re_metadata((), metadata, self.runtime_opts.use_fbcode_metadata)
+        let headers = with_re_metadata(
+            (),
+            metadata,
+            self.runtime_opts.use_fbcode_metadata,
+            self.request_metadata_tool_name.as_str(),
+        )
             .into_parts()
             .0;
         async move {
@@ -1089,6 +1131,7 @@ impl REClient {
                             },
                             metadata,
                             self.runtime_opts.use_fbcode_metadata,
+                            self.request_metadata_tool_name.as_str(),
                         ))
                         .await
                         .context("Failed to request what blobs are not present on remote")?;
@@ -1861,6 +1904,7 @@ fn with_re_metadata<T>(
     t: T,
     metadata: &RemoteExecutionMetadata,
     use_fbcode_metadata: bool,
+    request_metadata_tool_name: &str,
 ) -> tonic::Request<T> {
     // This creates a new Tonic request with attached metadata for the RE
     // backend. There are two cases here we need to support:
@@ -1911,29 +1955,56 @@ fn with_re_metadata<T>(
             .insert_bin("re-metadata-bin", MetadataValue::from_bytes(&encoded));
     } else {
         let mut encoded = Vec::new();
+        let RemoteExecutionMetadata {
+            correlated_invocations_id,
+            buck_info,
+            action_id,
+            action_mnemonic,
+            target_id,
+            configuration_id,
+            ..
+        } = metadata;
+
+        let correlated_invocations_id = correlated_invocations_id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                buck_info
+                    .as_ref()
+                    .map(|b| b.build_id.clone())
+                    .filter(|id| !id.is_empty())
+            })
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let (tool_invocation_id, tool_version) = match buck_info {
+            Some(buck_info) => {
+                let tool_version = if buck_info.version.is_empty() {
+                    "dev".to_owned()
+                } else {
+                    buck_info.version.clone()
+                };
+                (buck_info.build_id.clone(), tool_version)
+            }
+            None => (String::new(), "dev".to_owned()),
+        };
+
         RequestMetadata {
             tool_details: Some(ToolDetails {
-                tool_name: "buck2".to_owned(),
-                // TODO(#503): Pull the BuckVersion::get_unique_id() from BuckDaemon
-                tool_version: "0.1.0".to_owned(),
+                tool_name: request_metadata_tool_name.to_owned(),
+                tool_version,
             }),
-            action_id: "".to_owned(),
-            tool_invocation_id: metadata
-                .buck_info
-                .as_ref()
-                .map_or(String::new(), |buck_info| buck_info.build_id.clone()),
-            correlated_invocations_id: "".to_owned(),
-            action_mnemonic: "".to_owned(),
-            target_id: "".to_owned(),
-            configuration_id: "".to_owned(),
+            action_id: action_id.clone().unwrap_or_default(),
+            tool_invocation_id,
+            correlated_invocations_id,
+            action_mnemonic: action_mnemonic.clone().unwrap_or_default(),
+            target_id: target_id.clone().unwrap_or_default(),
+            configuration_id: configuration_id.clone().unwrap_or_default(),
         }
         .encode(&mut encoded)
         .expect("Encoding into a Vec cannot not fail");
 
-        msg.metadata_mut().insert_bin(
-            "build.bazel.remote.execution.v2.requestmetadata-bin",
-            MetadataValue::from_bytes(&encoded),
-        );
+        msg.metadata_mut()
+            .insert_bin(REQUEST_METADATA_HEADER, MetadataValue::from_bytes(&encoded));
     };
     msg
 }
@@ -1977,6 +2048,70 @@ mod tests {
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
 
     use super::*;
+
+    fn decode_request_metadata<T>(request: &tonic::Request<T>) -> RequestMetadata {
+        let metadata = request
+            .metadata()
+            .get_bin(REQUEST_METADATA_HEADER)
+            .expect("request metadata header should be present");
+        RequestMetadata::decode(metadata.to_bytes().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn request_metadata_tool_name_from_options_defaults_to_buck2() -> anyhow::Result<()> {
+        let opts = Buck2OssReConfiguration::default();
+        assert_eq!(
+            request_metadata_tool_name_from_options(&opts)?,
+            DEFAULT_REQUEST_METADATA_TOOL_NAME
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_metadata_tool_name_from_options_uses_configured_value() -> anyhow::Result<()> {
+        let opts = Buck2OssReConfiguration {
+            request_metadata_tool_name: Some("bazel".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(request_metadata_tool_name_from_options(&opts)?, "bazel");
+        Ok(())
+    }
+
+    #[test]
+    fn request_metadata_tool_name_from_options_rejects_empty_value() {
+        let opts = Buck2OssReConfiguration {
+            request_metadata_tool_name: Some(String::new()),
+            ..Default::default()
+        };
+        let err = request_metadata_tool_name_from_options(&opts)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("request_metadata_tool_name"));
+    }
+
+    #[test]
+    fn with_re_metadata_sets_request_metadata_tool_name() {
+        use crate::metadata::BuckInfo;
+        let request = with_re_metadata(
+            (),
+            &RemoteExecutionMetadata {
+                buck_info: Some(BuckInfo {
+                    build_id: "build-id".to_owned(),
+                    version: "version".to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            false,
+            "bazel",
+        );
+        let request_metadata = decode_request_metadata(&request);
+        let tool_details = request_metadata
+            .tool_details
+            .expect("tool details should be set");
+        assert_eq!(tool_details.tool_name, "bazel");
+        assert_eq!(tool_details.tool_version, "version");
+    }
 
     #[tokio::test]
     async fn test_retry_unauthenticated() {

@@ -391,6 +391,8 @@ impl IoHandler for DefaultIoHandler {
                         success: error.is_none(),
                         error,
                         method: Some(method.to_proto() as i32),
+                        // The materializer no longer downloads over HTTP, so there is never a URL.
+                        url: None,
                     },
                 )
             })
@@ -432,7 +434,7 @@ impl IoHandler for DefaultIoHandler {
         let connection = self.re_client_manager.get_re_connection();
         let re_client = connection.get_client().with_use_case(info.re_use_case);
         re_client
-            .upload_files_and_directories(files, vec![], vec![])
+            .upload_files_and_directories(files, vec![], vec![], None)
             .await?;
 
         Ok(())

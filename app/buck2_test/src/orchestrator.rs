@@ -125,6 +125,7 @@ use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::execute::result::CommandExecutionStatus;
 use buck2_execute::execute::target::CommandExecutionTarget;
+use buck2_execute::execute::target::request_metadata_target_id;
 use buck2_execute::materialize::materializer::HasMaterializer;
 use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::materializer::MaterializeRequest;
@@ -996,6 +997,7 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
                 suite_name: suite,
                 test_names: names,
                 target_label: Some(test_target.target().as_proto()),
+                labels: Vec::new(),
             })),
         });
 
@@ -1290,6 +1292,7 @@ impl BuckTestOrchestrator<'_> {
                 let start = TestDiscoveryStart {
                     target_label: Some(test_target.target.as_proto()),
                     suite_name: suite.clone(),
+                    labels: Vec::new(),
                 };
                 let (result, cached) = events
                     .span_async(start, async move {
@@ -1326,6 +1329,7 @@ impl BuckTestOrchestrator<'_> {
                             )
                             .ok(),
                             re_cache_enabled: *cacheable && re_cache_enabled,
+                            labels: Vec::new(),
                         };
                         ((result, cached), end)
                     })
@@ -1337,6 +1341,7 @@ impl BuckTestOrchestrator<'_> {
                         mergebase: &None,
                         re_platform: executor.re_platform(),
                         allow_cache_upload: true,
+                        paths: request.paths(),
                     };
                     let _result = match executor
                         .cache_upload(
@@ -1361,6 +1366,7 @@ impl BuckTestOrchestrator<'_> {
                     suite_name: suite.clone(),
                     test_names: testcases.clone(),
                     target_label: Some(test_target.target.as_proto()),
+                    labels: Vec::new(),
                 });
                 let start = TestRunStart {
                     suite: test_suite.clone(),
@@ -1396,6 +1402,7 @@ impl BuckTestOrchestrator<'_> {
                                 prepared_command.request.host_sharing_requirements().clone(),
                             )
                             .ok(),
+                            timeout: None,
                         };
                         (result, end)
                     })
@@ -2618,6 +2625,18 @@ impl CommandExecutionTarget for TestTarget<'_> {
             identifier: "".to_owned(),
         }
     }
+
+    fn action_mnemonic(&self) -> Option<String> {
+        Some("test".to_owned())
+    }
+
+    fn target_label(&self) -> Option<String> {
+        Some(request_metadata_target_id(self.target))
+    }
+
+    fn configuration_hash(&self) -> Option<String> {
+        Some(self.target.cfg().output_hash().as_str().to_owned())
+    }
 }
 
 fn create_action_key_suffix(stage: &TestStage) -> String {
@@ -2672,6 +2691,18 @@ impl CommandExecutionTarget for LocalResourceTarget<'_> {
             category: "setup_local_resource".to_owned(),
             identifier: "".to_owned(),
         }
+    }
+
+    fn action_mnemonic(&self) -> Option<String> {
+        Some("setup_local_resource".to_owned())
+    }
+
+    fn target_label(&self) -> Option<String> {
+        Some(request_metadata_target_id(self.target))
+    }
+
+    fn configuration_hash(&self) -> Option<String> {
+        Some(self.target.cfg().output_hash().as_str().to_owned())
     }
 }
 

@@ -102,6 +102,12 @@ async fn query_action_cache_and_download_result(
         CacheType::RemoteDepFileCache(key) => key.dupe().coerce::<ActionDigestKind>(),
         CacheType::ActionCache => action_digest.dupe(),
     };
+    let identity = ReActionIdentity::new(
+        command.target,
+        re_action_key.as_deref(),
+        command.request.paths(),
+        Some(action_digest.raw_digest().to_string()),
+    );
 
     let action_cache_response = span_async(
         buck2_data::ExecutorStageStart {
@@ -131,7 +137,6 @@ async fn query_action_cache_and_download_result(
     )
     .await;
 
-    let identity = None; // TODO(#503): implement this
     if upload_all_actions {
         if let Err(e) = re_client
             .upload(
@@ -140,7 +145,7 @@ async fn query_action_cache_and_download_result(
                 action_blobs,
                 ProjectRelativePath::empty(),
                 request.paths().input_directory(),
-                identity,
+                Some(&identity),
             )
             .await
         {
@@ -185,12 +190,6 @@ async fn query_action_cache_and_download_result(
             Some(dep_file_entry)
         }
     };
-
-    let identity = ReActionIdentity::new(
-        command.target,
-        re_action_key.as_deref(),
-        command.request.paths(),
-    );
 
     let response = ActionCacheResult(response, cache_type.to_proto());
     let res = download_action_results(

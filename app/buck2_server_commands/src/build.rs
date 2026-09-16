@@ -634,7 +634,12 @@ async fn process_build_result(
                     .use_case,
             )
             .await;
-            (res, buck2_data::CreateOutputSymlinksEnd {})
+            (
+                res,
+                buck2_data::CreateOutputSymlinksEnd {
+                    symlinks: Vec::new(),
+                },
+            )
         })
         .await?;
     }

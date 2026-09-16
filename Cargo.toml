@@ -180,6 +180,9 @@ members = [
   "pagable",
   "pagable_derive",
   "pagable_storage",
+  "remote_execution/oss/bazel_bep_proto",
+  "remote_execution/oss/bes_grpc_proto",
+  "remote_execution/oss/google_grpc_proto",
   "remote_execution/oss/re_grpc",
   "remote_execution/oss/re_grpc_proto",
   "shed/lock_free_hashtable",
@@ -226,6 +229,8 @@ async-trait = "0.1.92"
 atomic = "0.6.1"
 backtrace = "0.3"
 base64 = { version = "0.23.1", features = ["alloc"] }
+bazel_bep_proto = { path = "remote_execution/oss/bazel_bep_proto" }
+bes_grpc_proto = { path = "remote_execution/oss/bes_grpc_proto" }
 bincode = { version = "2", features = ["serde"] }
 bit-set = "0.11.1"
 blake3 = { version = "1.8", features = ["mmap", "rayon", "traits-preview"] }
@@ -329,6 +334,7 @@ buck2_wrapper_common = { path = "app/buck2_wrapper_common" }
 bumpalo = { version = "3.20.3", features = ["allocator_api", "collections"] }
 bytes = { version = "1.12.1", features = ["serde"] }
 bytesize = "2.7.0"
+chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 cmp_any = { version = "0.8.1", path = "gazebo/cmp_any" }
@@ -377,6 +383,7 @@ fxhash = "0.2.1"
 games = { path = "games" }
 glob = "0.3.4"
 globset = { version = "0.4.20", features = ["serde1"] }
+google_grpc_proto = { path = "remote_execution/oss/google_grpc_proto" }
 h2 = "0.4.19"
 hashbrown = "0.17.1"
 hex = { version = "0.4.3", features = ["alloc"] }
