@@ -14,6 +14,7 @@ use buck2_build_api::build::ProviderArtifacts;
 use buck2_cli_proto::build_request::Materializations;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_error::BuckErrorContext;
 use buck2_error::ErrorTag;
@@ -28,6 +29,12 @@ use buck2_util::future::try_join_all;
 use dupe::Dupe;
 use itertools::Itertools;
 use tracing::info;
+
+/// A convenience symlink the build declared: `path` in the project, `target` under buck-out.
+pub(crate) struct CreatedUnhashedOutputLink {
+    pub(crate) path: String,
+    pub(crate) target: String,
+}
 
 type UnhashedOutputLinks =
     IndexMap<ProjectRelativePathBuf, IndexMap<ProjectRelativePathBuf, ArtifactValue>>;
@@ -71,7 +78,7 @@ pub(crate) async fn create_unhashed_outputs_via_materializer(
     materializer: &dyn Materializer,
     materializations: Materializations,
     re_use_case: RemoteExecutorUseCase,
-) -> buck2_error::Result<()> {
+) -> buck2_error::Result<Vec<CreatedUnhashedOutputLink>> {
     create_unhashed_outputs_via_materializer_impl(
         provider_artifacts,
         artifact_fs,
@@ -92,9 +99,11 @@ async fn create_unhashed_outputs_via_materializer_impl(
     materializer: &dyn Materializer,
     materializations: Materializations,
     re_use_case: RemoteExecutorUseCase,
-) -> buck2_error::Result<()> {
+) -> buck2_error::Result<Vec<CreatedUnhashedOutputLink>> {
     let unhashed_to_hashed = unhashed_output_links(provider_artifacts, artifact_fs)?;
+    let buck_out_root = artifact_fs.buck_out_path_resolver().root();
     let mut declarations = Vec::new();
+    let mut links = Vec::new();
 
     for (unhashed, hashed_set) in unhashed_to_hashed {
         if let Ok((hashed, _)) = hashed_set.iter().exactly_one() {
@@ -105,6 +114,10 @@ async fn create_unhashed_outputs_via_materializer_impl(
                 &unhashed,
             )?;
             let symlink_value = builder.build(&unhashed)?;
+            links.push(CreatedUnhashedOutputLink {
+                path: unhashed.to_string(),
+                target: output_base_relative_path(hashed, buck_out_root)?,
+            });
             declarations.push((unhashed, symlink_value));
         } else {
             info!(
@@ -121,7 +134,7 @@ async fn create_unhashed_outputs_via_materializer_impl(
     )
     .await?;
     let required = match materializations {
-        Materializations::Skip => return Ok(()),
+        Materializations::Skip => return Ok(Vec::new()),
         Materializations::Default => false,
         Materializations::Materialize => true,
     };
@@ -136,5 +149,26 @@ async fn create_unhashed_outputs_via_materializer_impl(
     // Read after the command returns, so there is no scope to hold the lease over.
     drop(response.ensure_results_ok()?);
 
-    Ok(())
+    Ok(links)
+}
+
+fn output_base_relative_path(
+    path: &ProjectRelativePath,
+    buck_out_root: &ProjectRelativePath,
+) -> buck2_error::Result<String> {
+    Ok(path.strip_prefix(buck_out_root)?.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_base_relative_path_strips_buck_out_root() -> buck2_error::Result<()> {
+        let root = ProjectRelativePath::new("buck-out/v2")?;
+        let path = ProjectRelativePath::new("buck-out/v2/gen/root/pkg/out")?;
+
+        assert_eq!(output_base_relative_path(path, root)?, "gen/root/pkg/out");
+        Ok(())
+    }
 }
