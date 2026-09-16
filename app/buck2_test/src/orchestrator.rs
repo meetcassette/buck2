@@ -603,6 +603,7 @@ impl<'a> BuckTestOrchestrator<'a> {
         } = key;
         let fs = dice.get_artifact_fs().await?;
         let test_info = Self::get_test_info(dice, &test_target, internal_runner_config).await?;
+        let test_labels = test_labels(&test_info);
         let effective_test_execution_caching =
             test_info.supports_test_execution_caching() && !disable_test_execution_caching;
         let disable_local_network_isolation =
@@ -710,6 +711,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             cancellation,
             &test_target,
             &stage,
+            &test_labels,
             test_executor.executor(),
             execution_request,
             liveliness_observer.dupe(),
@@ -992,12 +994,15 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
     ) -> buck2_error::Result<()> {
         let test_target = self.session.get(test_target)?;
 
+        let test_info = Self::get_test_info(self.dice.dupe().deref_mut(), &test_target).await?;
+        let labels = test_labels(&test_info);
+
         self.events.instant_event(TestDiscovery {
             data: Some(buck2_data::test_discovery::Data::Tests(TestSuite {
                 suite_name: suite,
                 test_names: names,
                 target_label: Some(test_target.target().as_proto()),
-                labels: Vec::new(),
+                labels,
             })),
         });
 
@@ -1252,6 +1257,7 @@ impl BuckTestOrchestrator<'_> {
         cancellation: &CancellationContext,
         test_target_label: &ConfiguredProvidersLabel,
         stage: &TestStage,
+        test_labels: &[String],
         executor: &CommandExecutor,
         request: CommandExecutionRequest,
         liveliness_observer: Arc<dyn LivelinessObserver>,
@@ -1292,7 +1298,7 @@ impl BuckTestOrchestrator<'_> {
                 let start = TestDiscoveryStart {
                     target_label: Some(test_target.target.as_proto()),
                     suite_name: suite.clone(),
-                    labels: Vec::new(),
+                    labels: test_labels.to_vec(),
                 };
                 let (result, cached) = events
                     .span_async(start, async move {
@@ -1329,7 +1335,7 @@ impl BuckTestOrchestrator<'_> {
                             )
                             .ok(),
                             re_cache_enabled: *cacheable && re_cache_enabled,
-                            labels: Vec::new(),
+                            labels: test_labels.to_vec(),
                         };
                         ((result, cached), end)
                     })
@@ -1366,7 +1372,7 @@ impl BuckTestOrchestrator<'_> {
                     suite_name: suite.clone(),
                     test_names: testcases.clone(),
                     target_label: Some(test_target.target.as_proto()),
-                    labels: Vec::new(),
+                    labels: test_labels.to_vec(),
                 });
                 let start = TestRunStart {
                     suite: test_suite.clone(),
@@ -1402,7 +1408,7 @@ impl BuckTestOrchestrator<'_> {
                                 prepared_command.request.host_sharing_requirements().clone(),
                             )
                             .ok(),
-                            timeout: None,
+                            timeout: test_timeout_proto(prepared_command.request.timeout()),
                         };
                         (result, end)
                     })
@@ -2639,6 +2645,14 @@ impl CommandExecutionTarget for TestTarget<'_> {
     }
 }
 
+fn test_labels(test_info: &FrozenExternalRunnerTestInfo) -> Vec<String> {
+    test_info.labels().map(str::to_owned).collect()
+}
+
+fn test_timeout_proto(timeout: Option<Duration>) -> Option<prost_types::Duration> {
+    timeout.and_then(|timeout| timeout.try_into().ok())
+}
+
 fn create_action_key_suffix(stage: &TestStage) -> String {
     let mut action_key_suffix = match &stage {
         TestStage::Listing { .. } => "listing".to_owned(),
@@ -2924,6 +2938,7 @@ mod tests {
                 CancellationContext::testing(),
                 &label,
                 &stage,
+                &[],
                 &executor,
                 request,
                 NoopLivelinessObserver::create(),
@@ -3069,6 +3084,14 @@ mod tests {
             cacheable: true,
         };
         assert_eq!(create_action_key_suffix(&stage), "listing");
+    }
+
+    #[test]
+    fn test_timeout_proto_preserves_seconds() {
+        let timeout = test_timeout_proto(Some(Duration::from_secs(42))).expect("timeout");
+
+        assert_eq!(timeout.seconds, 42);
+        assert_eq!(timeout.nanos, 0);
     }
 
     #[test]
