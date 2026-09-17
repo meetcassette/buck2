@@ -1260,6 +1260,12 @@ pub(crate) struct BazelEventConverter {
     command_profile: CommandProfileBuilder,
     bes_progress: BesProgressState,
     pending_pre_start_events: Vec<bep::BuildEvent>,
+    // ActionExecuted events are tagged with the action's own (real) configuration id, not the
+    // synthetic DEFAULT_CONFIGURATION_ID default_configuration_event() announces — so a consumer
+    // that requires every referenced Configuration to have been announced first (bb-portal does,
+    // for ActionExecuted specifically) never sees a match. Tracks which real ids we've announced
+    // this invocation, so each one gets a Configuration event the first time an action references it.
+    announced_action_configurations: BTreeSet<String>,
 }
 
 impl BazelEventConverter {
@@ -1503,12 +1509,18 @@ impl BazelEventConverter {
                         .output_artifacts_from_action_cache_count
                         .saturating_add(action.outputs.len() as u64);
                 }
-                if (!self.skip_successful_action_events || action.failed)
-                    && let Some(action_event) = action_event(event, span_end, action)
-                {
-                    self.remember_action(&action_event);
-                    self.remember_target_outputs(action);
-                    events.push(action_event);
+                if !self.skip_successful_action_events || action.failed {
+                    if let Some(target) = action.key.as_ref().and_then(action_owner) {
+                        self.ensure_action_configuration_announced(
+                            configuration_id_for_target(target),
+                            events,
+                        );
+                    }
+                    if let Some(action_event) = action_event(event, span_end, action) {
+                        self.remember_action(&action_event);
+                        self.remember_target_outputs(action);
+                        events.push(action_event);
+                    }
                 }
             }
             Some(buck2_data::span_end_event::Data::TestDiscovery(test_discovery)) => {
@@ -2245,6 +2257,22 @@ impl BazelEventConverter {
             .entry(key)
             .and_modify(|state| state.success &= success)
             .or_insert(CompletedTargetState { success });
+    }
+
+    // ActionExecuted events reference the action's real configuration id (see
+    // configuration_id_for_target), which is almost never DEFAULT_CONFIGURATION_ID (that one is
+    // always pre-announced by default_configuration_event() at command start, so it's excluded
+    // here to avoid a redundant second Configuration event for it). Every other id needs its own
+    // Configuration event, once, before the first ActionExecuted that references it.
+    fn ensure_action_configuration_announced(
+        &mut self,
+        id: String,
+        events: &mut Vec<bep::BuildEvent>,
+    ) {
+        if id != DEFAULT_CONFIGURATION_ID && self.announced_action_configurations.insert(id.clone())
+        {
+            events.push(configuration_event_for_id(id));
+        }
     }
 
     fn remember_action(&mut self, event: &bep::BuildEvent) {
@@ -4084,6 +4112,25 @@ fn default_configuration_event() -> bep::BuildEvent {
             mnemonic: DEFAULT_CONFIGURATION_ID.to_owned(),
             platform_name: String::new(),
             cpu: env::consts::ARCH.to_owned(),
+            make_variable: HashMap::new(),
+            is_tool: false,
+        })),
+        last_message: false,
+    }
+}
+
+// Same shape as default_configuration_event(), for a real (non-default) configuration id an
+// ActionExecuted event is about to reference. We only have the id itself at this call site (see
+// configuration_id_for_target), not a full buck2_data::Configuration, so mnemonic is the id and
+// platform_name/cpu/make_variable stay empty rather than guessed.
+fn configuration_event_for_id(id: String) -> bep::BuildEvent {
+    bep::BuildEvent {
+        id: Some(configuration_event_id(id.clone())),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::Configuration(bep::Configuration {
+            mnemonic: id,
+            platform_name: String::new(),
+            cpu: String::new(),
             make_variable: HashMap::new(),
             is_tool: false,
         })),
@@ -12701,6 +12748,12 @@ mod tests {
             )),
         );
 
+        assert_eq!(action[0].id, Some(configuration_event_id("cfg".to_owned())));
+        assert!(matches!(
+            action[0].payload,
+            Some(build_event::Payload::Configuration(_))
+        ));
+        let action = &action[1..];
         let Some(build_event_id::Id::ActionCompleted(action_id)) =
             action[0].id.as_ref().and_then(|id| id.id.as_ref())
         else {
@@ -13778,6 +13831,12 @@ mod tests {
                 .any(|event| matches!(event.payload, Some(build_event::Payload::Completed(_))))
         );
 
+        assert_eq!(action[0].id, Some(configuration_event_id("cfg".to_owned())));
+        assert!(matches!(
+            action[0].payload,
+            Some(build_event::Payload::Configuration(_))
+        ));
+        let action = &action[1..];
         let Some(build_event_id::Id::ActionCompleted(action_id)) =
             action[0].id.as_ref().and_then(|id| id.id.as_ref())
         else {
