@@ -6278,7 +6278,7 @@ fn append_critical_path_spans(
             parent_id: 0,
             name: critical_path_entry_name(entry),
             lane: ProfileLane::CriticalPath,
-            category: "critical path",
+            category: "critical path component",
             start_us,
             duration_us,
             args,
@@ -6547,7 +6547,7 @@ fn command_profile_json(record: &buck2_data::InvocationRecord) -> serde_json::Re
         }));
         trace_events.push(serde_json::json!({
             "name": "critical path",
-            "cat": "critical_path",
+            "cat": "critical path",
             "ph": "X",
             "ts": command_duration_us.saturating_sub(critical_path_us),
             "dur": critical_path_us,
@@ -6960,7 +6960,12 @@ fn bep_file_from_action_output(output: &buck2_data::ActionOutput) -> Option<bep:
         name,
         path_prefix: Vec::new(),
         file: action_output_uri(output).map(bep::file::File::Uri),
-        digest: output.digest.clone(),
+        // BEP wants the bare hex hash; buck2's digest is `hash:size`, and the size goes in `length`.
+        digest: output
+            .digest
+            .split_once(':')
+            .map_or(output.digest.as_str(), |(hash, _size)| hash)
+            .to_owned(),
         length: i64::try_from(output.size).unwrap_or(i64::MAX),
     })
 }
@@ -12474,11 +12479,9 @@ mod tests {
         append_critical_path_spans(&mut spans, Some(1_000), &critical_path);
 
         assert_eq!(spans.len(), 2);
-        assert!(
-            spans
-                .iter()
-                .all(|s| s.lane == ProfileLane::CriticalPath && s.category == "critical path")
-        );
+        assert!(spans.iter().all(
+            |s| s.lane == ProfileLane::CriticalPath && s.category == "critical path component"
+        ));
         assert_eq!(spans[0].name, "load //pkg");
         assert_eq!(spans[0].start_us, 1_000); // command_start(1000) + offset 0ns
         assert_eq!(spans[0].duration_us, 100);
@@ -12740,7 +12743,7 @@ mod tests {
             .as_ref()
             .expect("successful action primary output");
         assert_eq!(primary_output.name, "buck-out/main.o");
-        assert_eq!(primary_output.digest, "abcd:10");
+        assert_eq!(primary_output.digest, "abcd");
         assert_eq!(primary_output.length, 10);
         assert!(primary_output.file.is_none());
 
@@ -12779,7 +12782,7 @@ mod tests {
         assert_eq!(completed.important_output.len(), 1);
         let important_output = &completed.important_output[0];
         assert_eq!(important_output.name, "buck-out/main.o");
-        assert_eq!(important_output.digest, "abcd:10");
+        assert_eq!(important_output.digest, "abcd");
         assert_eq!(important_output.length, 10);
         let target_summary = final_events
             .iter()
@@ -12873,7 +12876,7 @@ mod tests {
         assert_eq!(completed.directory_output.len(), 1);
         let directory = &completed.directory_output[0];
         assert_eq!(directory.name, "buck-out/main.resources");
-        assert_eq!(directory.digest, "tree-digest:42");
+        assert_eq!(directory.digest, "tree-digest");
         assert_eq!(directory.length, 42);
         assert!(directory.file.is_none());
         assert_eq!(completed.output_group.len(), 1);
@@ -12891,7 +12894,7 @@ mod tests {
             .expect("NamedSetOfFiles event");
         assert_eq!(named_set.files.len(), 1);
         assert_eq!(named_set.files[0].name, "buck-out/main.resources");
-        assert_eq!(named_set.files[0].digest, "tree-digest:42");
+        assert_eq!(named_set.files[0].digest, "tree-digest");
         assert_eq!(named_set.files[0].length, 42);
         assert!(named_set.files[0].file.is_none());
     }

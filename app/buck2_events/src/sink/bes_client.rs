@@ -66,6 +66,7 @@ const MIN_CLOSE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_END_CLOSE_GRACE: Duration = Duration::from_millis(500);
 const COMMAND_END_CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_BAZEL_ARTIFACT_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024;
+const BAZEL_ARTIFACT_UPLOAD_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug)]
 pub struct BesConfig {
@@ -79,6 +80,7 @@ pub struct BesConfig {
     pub build_metadata: Vec<(String, String)>,
     pub event_format: BesEventFormat,
     pub bazel_artifact_upload: bool,
+    pub bazel_artifact_upload_local_outputs: bool,
     pub upload_successful_action_events: bool,
     pub bazel_artifact_upload_backend: Option<String>,
     pub re_client_cas_address: Option<String>,
@@ -108,6 +110,7 @@ impl Default for BesConfig {
             build_metadata: Vec::new(),
             event_format: BesEventFormat::Buck,
             bazel_artifact_upload: true,
+            bazel_artifact_upload_local_outputs: true,
             upload_successful_action_events: true,
             bazel_artifact_upload_backend: None,
             re_client_cas_address: None,
@@ -270,6 +273,32 @@ struct BazelArtifactUploadConfig {
     uri_authority: String,
     max_bytes: usize,
     grpc_timeout: Duration,
+    upload_local_outputs: bool,
+    backoff: UploadBackoff,
+}
+
+/// Shared by all streams of a BES worker, so an unreachable upload server costs one connect timeout, not one per file.
+#[derive(Clone, Debug, Default)]
+struct UploadBackoff(Arc<std::sync::Mutex<Option<Instant>>>);
+
+impl UploadBackoff {
+    fn active(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn trip(&self, endpoint: &str, status: &Status) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Instant::now() + BAZEL_ARTIFACT_UPLOAD_BACKOFF);
+        tracing::warn!(
+            "BES artifact upload to `{}` failed ({}); skipping uploads for {}s, logs stay inline",
+            endpoint,
+            status.message(),
+            BAZEL_ARTIFACT_UPLOAD_BACKOFF.as_secs()
+        );
+    }
 }
 
 impl BazelArtifactUploadConfig {
@@ -314,6 +343,8 @@ impl BazelArtifactUploadConfig {
             uri_authority,
             max_bytes: config.bazel_artifact_upload_max_bytes,
             grpc_timeout: config.grpc_timeout,
+            upload_local_outputs: config.bazel_artifact_upload_local_outputs,
+            backoff: UploadBackoff::default(),
         }))
     }
 }
@@ -441,7 +472,8 @@ impl BazelArtifactUploader {
                     if self.is_directory_output(file) {
                         continue;
                     }
-                    if !self.upload_file_if_local(file).await {
+                    if !(self.config.upload_local_outputs && self.upload_file_if_local(file).await)
+                    {
                         self.add_uri_for_digest_file(file);
                     }
                 }
@@ -463,10 +495,17 @@ impl BazelArtifactUploader {
         else {
             return;
         };
-        if file.name == "primary_output"
-            || contents.is_empty()
-            || contents.len() > self.config.max_bytes
-        {
+        if file.name == "primary_output" || contents.is_empty() || self.config.backoff.active() {
+            return;
+        }
+        if contents.len() > self.config.max_bytes {
+            tracing::warn!(
+                "BES: not uploading `{}` ({} bytes, over bes.bazel_artifact_upload_max_bytes = {}); \
+                 it stays inline, which bb-portal ignores",
+                file.name,
+                contents.len(),
+                self.config.max_bytes
+            );
             return;
         }
         let contents = contents.clone();
@@ -482,7 +521,7 @@ impl BazelArtifactUploader {
         &mut self,
         file: &mut bazel_bep_proto::build_event_stream::File,
     ) -> bool {
-        if file.file.is_some() {
+        if file.file.is_some() || self.config.backoff.active() {
             return false;
         }
         let Some(path) = self.local_file_path(file) else {
@@ -565,7 +604,8 @@ impl BazelArtifactUploader {
             finish_write: true,
             data: contents.to_vec(),
         };
-        let response = self.write_request(request).await.ok()?;
+        let result = self.write_request(request).await;
+        let response = self.note_failure(result)?;
         if response.committed_size != size && response.committed_size != -1 {
             return None;
         }
@@ -575,16 +615,14 @@ impl BazelArtifactUploader {
             &hash,
             size,
         );
-        Some((uri, format!("{hash}:{size}"), size))
+        Some((uri, hash, size))
     }
 
     async fn upload_local_file(&mut self, path: &Path, size: i64) -> Option<(String, String, i64)> {
         let hash = sha256_file(path)?;
         let resource_name = upload_resource_name(&self.config.instance_name, &hash, size);
-        let response = self
-            .write_file_requests(resource_name, path, size)
-            .await
-            .ok()?;
+        let result = self.write_file_requests(resource_name, path, size).await;
+        let response = self.note_failure(result)?;
         if response.committed_size != size && response.committed_size != -1 {
             return None;
         }
@@ -594,7 +632,23 @@ impl BazelArtifactUploader {
             &hash,
             size,
         );
-        Some((uri, format!("{hash}:{size}"), size))
+        Some((uri, hash, size))
+    }
+
+    fn note_failure<T>(&mut self, result: Result<T, Status>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(status) => {
+                if matches!(
+                    status.code(),
+                    tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+                ) {
+                    self.client = None;
+                    self.config.backoff.trip(&self.config.endpoint, &status);
+                }
+                None
+            }
+        }
     }
 
     async fn write_request(
@@ -1134,6 +1188,7 @@ struct WorkerState {
     connection: ConnectionConfig,
     counters: Arc<CounterState>,
     streams: HashMap<String, StreamState>,
+    upload_backoff: UploadBackoff,
 }
 
 impl WorkerState {
@@ -1143,6 +1198,7 @@ impl WorkerState {
             connection,
             counters,
             streams: HashMap::new(),
+            upload_backoff: UploadBackoff::default(),
         }
     }
 
@@ -1273,7 +1329,11 @@ impl WorkerState {
         if self.streams.contains_key(&parsed.invocation_id) {
             return Ok(());
         }
-        let upload_config = BazelArtifactUploadConfig::from_bes(&self.config, &self.connection)?;
+        let upload_config = BazelArtifactUploadConfig::from_bes(&self.config, &self.connection)?
+            .map(|config| BazelArtifactUploadConfig {
+                backoff: self.upload_backoff.clone(),
+                ..config
+            });
         let stream = StreamState::new(
             parsed,
             &self.config.build_metadata,
@@ -2135,6 +2195,8 @@ mod tests {
             uri_authority: "localhost:1985".to_owned(),
             max_bytes: 1024,
             grpc_timeout: Duration::from_secs(1),
+            upload_local_outputs: true,
+            backoff: UploadBackoff::default(),
         }
     }
 
@@ -2152,7 +2214,7 @@ mod tests {
                             name: "buck-out/gen/root/main".to_owned(),
                             path_prefix: Vec::new(),
                             file: None,
-                            digest: format!("{hash}:3"),
+                            digest: hash.to_owned(),
                             length: 3,
                         }],
                         file_sets: Vec::new(),
@@ -2185,7 +2247,7 @@ mod tests {
             name: "buck-out/gen/root/tree".to_owned(),
             path_prefix: Vec::new(),
             file: None,
-            digest: "tree-digest:42".to_owned(),
+            digest: "tree-digest".to_owned(),
             length: 42,
         };
         let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config());
@@ -2225,7 +2287,7 @@ mod tests {
             panic!("expected named set");
         };
         assert!(files.files[0].file.is_none());
-        assert_eq!(files.files[0].digest, "tree-digest:42");
+        assert_eq!(files.files[0].digest, "tree-digest");
         assert_eq!(files.files[0].length, 42);
     }
 
@@ -2273,7 +2335,7 @@ mod tests {
                             name: "buck-out/gen/root/main".to_owned(),
                             path_prefix: Vec::new(),
                             file: None,
-                            digest: "buck-digest:3".to_owned(),
+                            digest: "buck-digest".to_owned(),
                             length: 3,
                         }],
                         file_sets: Vec::new(),
@@ -2297,7 +2359,7 @@ mod tests {
         else {
             panic!("expected named set");
         };
-        assert_eq!(files.files[0].digest, format!("{hash}:3"));
+        assert_eq!(files.files[0].digest, hash);
         assert_eq!(files.files[0].length, 3);
         let uri = match files.files[0].file.as_ref() {
             Some(bazel_bep_proto::build_event_stream::file::File::Uri(uri)) => uri,
@@ -2335,7 +2397,7 @@ mod tests {
                             name: "buck-out/gen/root/main".to_owned(),
                             path_prefix: Vec::new(),
                             file: None,
-                            digest: "buck-digest:6".to_owned(),
+                            digest: "buck-digest".to_owned(),
                             length: 6,
                         }],
                         file_sets: Vec::new(),
@@ -2365,7 +2427,7 @@ mod tests {
         else {
             panic!("expected named set");
         };
-        assert_eq!(files.files[0].digest, format!("{hash}:6"));
+        assert_eq!(files.files[0].digest, hash);
         assert_eq!(files.files[0].length, 6);
         let uri = match files.files[0].file.as_ref() {
             Some(bazel_bep_proto::build_event_stream::file::File::Uri(uri)) => uri,
@@ -2396,7 +2458,7 @@ mod tests {
                             name: "../secret".to_owned(),
                             path_prefix: Vec::new(),
                             file: None,
-                            digest: format!("{hash}:3"),
+                            digest: hash.to_owned(),
                             length: 3,
                         }],
                         file_sets: Vec::new(),
@@ -2423,6 +2485,177 @@ mod tests {
             &format!("bytestream://localhost:1985/remote/instance/blobs/{hash}/3")
         );
         std::fs::remove_dir_all(repo_path).ok();
+    }
+
+    #[tokio::test]
+    async fn upload_event_files_only_links_named_set_files_without_local_outputs() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let repo_path =
+            std::env::temp_dir().join(format!("buck2-bes-client-test-{}", uuid::Uuid::new_v4()));
+        let output_path = repo_path.join("buck-out/gen/root/main");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        std::fs::write(&output_path, b"abc").unwrap();
+        let mut config = test_artifact_upload_config();
+        config.upload_local_outputs = false;
+        let mut uploader = BazelArtifactUploader::new(config);
+        uploader.repo_path = Some(repo_path.clone());
+        let mut event = bazel_bep_proto::build_event_stream::BuildEvent {
+            id: None,
+            children: Vec::new(),
+            payload: Some(
+                bazel_bep_proto::build_event_stream::build_event::Payload::NamedSetOfFiles(
+                    bazel_bep_proto::build_event_stream::NamedSetOfFiles {
+                        files: vec![bazel_bep_proto::build_event_stream::File {
+                            name: "buck-out/gen/root/main".to_owned(),
+                            path_prefix: Vec::new(),
+                            file: None,
+                            digest: hash.to_owned(),
+                            length: 3,
+                        }],
+                        file_sets: Vec::new(),
+                    },
+                ),
+            ),
+            last_message: false,
+        };
+
+        uploader.upload_event_files(&mut event).await;
+
+        assert!(uploader.test_writes.is_empty());
+        let Some(bazel_bep_proto::build_event_stream::build_event::Payload::NamedSetOfFiles(files)) =
+            event.payload
+        else {
+            panic!("expected named set");
+        };
+        assert_eq!(files.files[0].digest, hash);
+        let uri = match files.files[0].file.as_ref() {
+            Some(bazel_bep_proto::build_event_stream::file::File::Uri(uri)) => uri,
+            other => panic!("expected URI, got {other:?}"),
+        };
+        assert_eq!(
+            uri,
+            &format!("bytestream://localhost:1985/remote/instance/blobs/{hash}/3")
+        );
+        std::fs::remove_dir_all(repo_path).ok();
+    }
+
+    fn build_tool_logs_event(contents: &[u8]) -> bazel_bep_proto::build_event_stream::BuildEvent {
+        bazel_bep_proto::build_event_stream::BuildEvent {
+            id: None,
+            children: Vec::new(),
+            payload: Some(
+                bazel_bep_proto::build_event_stream::build_event::Payload::BuildToolLogs(
+                    bazel_bep_proto::build_event_stream::BuildToolLogs {
+                        log: vec![bazel_bep_proto::build_event_stream::File {
+                            name: "command.profile.gz".to_owned(),
+                            path_prefix: Vec::new(),
+                            file: Some(bazel_bep_proto::build_event_stream::file::File::Contents(
+                                contents.to_vec(),
+                            )),
+                            digest: String::new(),
+                            length: 0,
+                        }],
+                    },
+                ),
+            ),
+            last_message: false,
+        }
+    }
+
+    fn build_tool_log(
+        event: &bazel_bep_proto::build_event_stream::BuildEvent,
+    ) -> &bazel_bep_proto::build_event_stream::File {
+        let Some(bazel_bep_proto::build_event_stream::build_event::Payload::BuildToolLogs(logs)) =
+            event.payload.as_ref()
+        else {
+            panic!("expected build tool logs");
+        };
+        &logs.log[0]
+    }
+
+    #[tokio::test]
+    async fn upload_event_files_uploads_inline_build_tool_logs_with_bare_digest() {
+        let contents = b"profile";
+        let mut hasher = Sha256::new();
+        hasher.update(contents);
+        let hash = format!("{:x}", hasher.finalize());
+        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config());
+        let mut event = build_tool_logs_event(contents);
+
+        uploader.upload_event_files(&mut event).await;
+
+        assert_eq!(uploader.test_writes.len(), 1);
+        let log = build_tool_log(&event);
+        assert_eq!(log.digest, hash);
+        assert_eq!(log.length, 7);
+        assert_eq!(
+            log.file,
+            Some(bazel_bep_proto::build_event_stream::file::File::Uri(
+                format!("bytestream://localhost:1985/remote/instance/blobs/{hash}/7")
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_upload_server_is_skipped_by_later_uploads() {
+        let mut config = test_artifact_upload_config();
+        config.endpoint = "http://127.0.0.1:1".to_owned();
+        config.grpc_timeout = Duration::from_millis(200);
+        let backoff = config.backoff.clone();
+        let mut dead = BazelArtifactUploader::new(config);
+        let mut event = build_tool_logs_event(b"profile");
+
+        dead.upload_event_files(&mut event).await;
+
+        assert!(backoff.active());
+        assert!(matches!(
+            build_tool_log(&event).file,
+            Some(bazel_bep_proto::build_event_stream::file::File::Contents(_))
+        ));
+
+        let mut config = test_artifact_upload_config();
+        config.backoff = backoff;
+        let mut later = BazelArtifactUploader::new(config);
+        let mut event = build_tool_logs_event(b"profile");
+
+        later.upload_event_files(&mut event).await;
+
+        assert!(later.test_writes.is_empty());
+        assert!(matches!(
+            build_tool_log(&event).file,
+            Some(bazel_bep_proto::build_event_stream::file::File::Contents(_))
+        ));
+    }
+
+    #[test]
+    fn worker_streams_share_one_upload_backoff() {
+        let config = BesConfig {
+            event_format: BesEventFormat::Bazel,
+            ..BesConfig::default()
+        };
+        let connection = ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            headers: Vec::new(),
+        };
+        let mut worker = WorkerState::new(config, connection, Arc::new(CounterState::default()));
+        for _ in 0..2 {
+            let message = make_message(
+                Some(&TraceId::new().to_string()),
+                Some(1),
+                command_start_data(),
+            );
+            let parsed = ParsedMessage::from_message(&message).expect("valid message");
+            worker.ensure_stream_exists(&parsed).unwrap();
+        }
+        assert_eq!(worker.streams.len(), 2);
+        worker.upload_backoff.trip(
+            "http://127.0.0.1:1",
+            &Status::unavailable("connection refused"),
+        );
+        for stream in worker.streams.values() {
+            let uploader = stream.bazel_artifact_uploader.as_ref().expect("uploader");
+            assert!(uploader.config.backoff.active());
+        }
     }
 
     #[test]
