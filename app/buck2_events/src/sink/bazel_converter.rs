@@ -112,28 +112,6 @@ impl ProfileLane {
             Self::Other => "Buck2 other",
         }
     }
-
-    fn track_base(self) -> u64 {
-        match self {
-            Self::Command => 1,
-            Self::CriticalPath => 400,
-            Self::Phases => 500,
-            Self::Loading => 1_000,
-            Self::Analysis => 2_000,
-            Self::Actions => 3_000,
-            Self::ActionStages => 4_000,
-            Self::Tests => 5_000,
-            Self::Materialization => 6_000,
-            Self::Cache => 7_000,
-            Self::Dice => 8_000,
-            Self::Other => 9_000,
-        }
-    }
-
-    fn tid(self, index: usize) -> u64 {
-        self.track_base()
-            .saturating_add(u64::try_from(index).unwrap_or(u64::MAX))
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -184,6 +162,75 @@ struct CommandProfileBuilder {
     next_synthetic_span_id: u64,
     dropped_spans: usize,
     critical_path: Vec<buck2_data::CriticalPathEntry2>,
+}
+
+/// Lays profile spans out on Chrome-trace threads so that slices on one thread always nest.
+#[derive(Default)]
+struct ProfileTracks {
+    /// Per track, the still-open slices as (span id, end), outermost first.
+    open: Vec<Vec<(u64, i64)>>,
+    lanes: BTreeMap<ProfileLane, Vec<usize>>,
+    span_tracks: HashMap<u64, (usize, ProfileLane)>,
+}
+
+impl ProfileTracks {
+    /// Spans must arrive ordered by start, longest first.
+    fn place(&mut self, span: &ProfileCompletedSpan, end_us: i64) -> usize {
+        let track = self
+            .parent_track(span, end_us)
+            .unwrap_or_else(|| self.free_lane_track(span.lane, span.start_us));
+        self.open[track].push((span.span_id, end_us));
+        if span.span_id != 0 {
+            self.span_tracks.insert(span.span_id, (track, span.lane));
+        }
+        track
+    }
+
+    /// The parent's track, if the parent is the innermost open slice there and contains the span.
+    fn parent_track(&mut self, span: &ProfileCompletedSpan, end_us: i64) -> Option<usize> {
+        if span.parent_id == 0 {
+            return None;
+        }
+        let (track, parent_lane) = *self.span_tracks.get(&span.parent_id)?;
+        let same_row = parent_lane != ProfileLane::Command
+            && (parent_lane == span.lane
+                || (parent_lane == ProfileLane::Actions && span.lane == ProfileLane::ActionStages));
+        if !same_row {
+            return None;
+        }
+        close_ended_slices(&mut self.open[track], span.start_us);
+        let (innermost, innermost_end_us) = *self.open[track].last()?;
+        (innermost == span.parent_id && end_us <= innermost_end_us).then_some(track)
+    }
+
+    fn free_lane_track(&mut self, lane: ProfileLane, start_us: i64) -> usize {
+        let lane_tracks = self.lanes.entry(lane).or_default();
+        for track in lane_tracks.iter() {
+            close_ended_slices(&mut self.open[*track], start_us);
+            if self.open[*track].is_empty() {
+                return *track;
+            }
+        }
+        self.open.push(Vec::new());
+        let track = self.open.len() - 1;
+        lane_tracks.push(track);
+        track
+    }
+
+    /// Tids by track, numbered from 1 in lane order so viewers that sort by tid group lanes.
+    fn tids(&self) -> Vec<u64> {
+        let mut tids = vec![0; self.open.len()];
+        for (tid, track) in self.lanes.values().flatten().enumerate() {
+            tids[*track] = tid as u64 + 1;
+        }
+        tids
+    }
+}
+
+fn close_ended_slices(open: &mut Vec<(u64, i64)>, start_us: i64) {
+    while open.last().is_some_and(|(_, end_us)| *end_us <= start_us) {
+        open.pop();
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2934,6 +2981,11 @@ impl CommandProfileBuilder {
             .or_else(|| spans.iter().map(|span| span.start_us).min())
             .unwrap_or_default();
 
+        // Clamp before sorting: Perfetto needs a containing slice ahead of what it contains.
+        for span in &mut spans {
+            span.start_us = span.start_us.saturating_sub(base_us).max(0);
+            span.duration_us = span.duration_us.max(1);
+        }
         spans.sort_by(|left, right| {
             left.start_us
                 .cmp(&right.start_us)
@@ -2941,45 +2993,25 @@ impl CommandProfileBuilder {
                 .then_with(|| left.span_id.cmp(&right.span_id))
         });
 
-        let mut trace_events = Vec::new();
-        let mut lane_tracks: BTreeMap<ProfileLane, Vec<i64>> = BTreeMap::new();
-        let mut span_tracks: BTreeMap<u64, (u64, ProfileLane)> = BTreeMap::new();
-
+        let mut tracks = ProfileTracks::default();
+        let mut placed = Vec::with_capacity(spans.len());
         for span in spans {
-            let start_us = span.start_us.saturating_sub(base_us).max(0);
-            let duration_us = span.duration_us.max(1);
-            let end_us = start_us.saturating_add(duration_us);
-            let parent_track = (span.parent_id != 0)
-                .then(|| span_tracks.get(&span.parent_id).copied())
-                .flatten();
-            let tid = if let Some((parent_tid, parent_lane)) = parent_track
-                && parent_lane != ProfileLane::Command
-                && (parent_lane == span.lane
-                    || (parent_lane == ProfileLane::Actions
-                        && span.lane == ProfileLane::ActionStages))
-            {
-                parent_tid
-            } else {
-                let tracks = lane_tracks.entry(span.lane).or_default();
-                let track_index = tracks
-                    .iter()
-                    .position(|last_end_us| *last_end_us <= start_us)
-                    .unwrap_or_else(|| {
-                        tracks.push(0);
-                        tracks.len() - 1
-                    });
-                tracks[track_index] = end_us;
-                span.lane.tid(track_index)
-            };
-            span_tracks.insert(span.span_id, (tid, span.lane));
+            let end_us = span.start_us.saturating_add(span.duration_us);
+            let track = tracks.place(&span, end_us);
+            placed.push((track, span));
+        }
+        let tids = tracks.tids();
+
+        let mut trace_events = Vec::with_capacity(placed.len());
+        for (track, span) in placed {
             trace_events.push(serde_json::json!({
                 "name": span.name,
                 "cat": span.category,
                 "ph": "X",
-                "ts": start_us,
-                "dur": duration_us,
+                "ts": span.start_us,
+                "dur": span.duration_us,
                 "pid": 1,
-                "tid": tid,
+                "tid": tids[track],
                 "args": span.args,
             }));
         }
@@ -3005,10 +3037,11 @@ impl CommandProfileBuilder {
             "pid": 1,
             "args": { "name": "buck2" },
         })];
-        for (lane, tracks) in &lane_tracks {
-            for index in 0..tracks.len() {
-                let tid = lane.tid(index);
-                let name = if tracks.len() == 1 {
+        for (lane, lane_tracks) in &tracks.lanes {
+            for (index, track) in lane_tracks.iter().enumerate() {
+                let tid = tids[*track];
+                // Bazel names this thread exactly; tools look it up by that name.
+                let name = if lane_tracks.len() == 1 || *lane == ProfileLane::CriticalPath {
                     lane.label().to_owned()
                 } else {
                     format!("{} {}", lane.label(), index + 1)
@@ -3019,6 +3052,13 @@ impl CommandProfileBuilder {
                     "pid": 1,
                     "tid": tid,
                     "args": { "name": name },
+                }));
+                metadata_events.push(serde_json::json!({
+                    "name": "thread_sort_index",
+                    "ph": "M",
+                    "pid": 1,
+                    "tid": tid,
+                    "args": { "sort_index": tid },
                 }));
             }
         }
@@ -6255,8 +6295,11 @@ fn append_critical_path_spans(
             .map(duration_micros)
             .unwrap_or_default()
             .max(1);
+        // Never before the previous entry's end: durations are floored at 1us, offsets are not.
         let start_us = match entry.start_offset_ns {
-            Some(offset_ns) => command_start.saturating_add((offset_ns / 1_000) as i64),
+            Some(offset_ns) => command_start
+                .saturating_add((offset_ns / 1_000) as i64)
+                .max(cursor),
             None => cursor,
         };
         cursor = start_us.saturating_add(duration_us);
@@ -8089,7 +8132,257 @@ mod tests {
             .read_to_string(&mut profile)
             .expect("valid gzip profile");
         assert!(profile.contains("\"traceEvents\":[\n"));
-        serde_json::from_str(&profile).expect("valid profile json")
+        let profile = serde_json::from_str(&profile).expect("valid profile json");
+        assert_profile_tracks_nest(&profile);
+        profile
+    }
+
+    /// Perfetto's rule for complete events: on one thread a slice may not outlive the slice it
+    /// starts in. Also checks that every thread has exactly one name.
+    fn assert_profile_tracks_nest(profile: &serde_json::Value) {
+        let events = profile["traceEvents"].as_array().expect("trace events");
+        let mut names: BTreeMap<(i64, i64), Vec<String>> = BTreeMap::new();
+        let mut slices: BTreeMap<(i64, i64), Vec<(i64, i64, String)>> = BTreeMap::new();
+        for event in events {
+            let Some(tid) = event["tid"].as_i64() else {
+                continue;
+            };
+            let key = (event["pid"].as_i64().expect("pid"), tid);
+            let name = |value: &serde_json::Value| value.as_str().expect("name").to_owned();
+            if event["ph"] == "M" && event["name"] == "thread_name" {
+                names
+                    .entry(key)
+                    .or_default()
+                    .push(name(&event["args"]["name"]));
+            } else if event["ph"] == "X" {
+                let ts = event["ts"].as_i64().expect("ts");
+                let end = ts + event["dur"].as_i64().expect("dur");
+                slices
+                    .entry(key)
+                    .or_default()
+                    .push((ts, end, name(&event["name"])));
+            }
+        }
+        for (key, names) in &names {
+            assert_eq!(names.len(), 1, "thread {key:?} is named {names:?}");
+        }
+        for (key, slices) in &mut slices {
+            assert!(names.contains_key(key), "thread {key:?} has no name");
+            slices.sort_by_key(|(ts, end, _)| (*ts, -*end));
+            let mut open: Vec<&(i64, i64, String)> = Vec::new();
+            for slice in slices.iter() {
+                while open.last().is_some_and(|top| top.1 <= slice.0) {
+                    open.pop();
+                }
+                if let Some(top) = open.last() {
+                    assert!(
+                        slice.1 <= top.1,
+                        "on thread {key:?} {slice:?} starts inside {top:?} and outlives it"
+                    );
+                }
+                open.push(slice);
+            }
+        }
+    }
+
+    fn profile_span(
+        span_id: u64,
+        parent_id: u64,
+        name: &str,
+        lane: ProfileLane,
+        start_us: i64,
+        duration_us: i64,
+    ) -> ProfileCompletedSpan {
+        ProfileCompletedSpan {
+            span_id,
+            parent_id,
+            name: name.to_owned(),
+            lane,
+            category: "x",
+            start_us,
+            duration_us,
+            args: serde_json::Map::new(),
+        }
+    }
+
+    fn profile_of(builder: &CommandProfileBuilder) -> serde_json::Value {
+        let profile = builder.profile_json(None).expect("profile json");
+        let profile = serde_json::from_str(&profile).expect("valid profile json");
+        assert_profile_tracks_nest(&profile);
+        profile
+    }
+
+    fn profile_tid(profile: &serde_json::Value, name: &str) -> i64 {
+        profile["traceEvents"]
+            .as_array()
+            .expect("trace events")
+            .iter()
+            .find(|event| event["ph"] == "X" && event["name"] == name)
+            .unwrap_or_else(|| panic!("missing slice {name}"))["tid"]
+            .as_i64()
+            .expect("tid")
+    }
+
+    fn profile_thread_names(profile: &serde_json::Value) -> Vec<String> {
+        profile["traceEvents"]
+            .as_array()
+            .expect("trace events")
+            .iter()
+            .filter(|event| event["ph"] == "M" && event["name"] == "thread_name")
+            .map(|event| event["args"]["name"].as_str().expect("name").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn profile_lanes_with_over_a_thousand_concurrent_spans_keep_their_own_threads() {
+        let mut builder = CommandProfileBuilder {
+            command_started_at_us: Some(0),
+            ..Default::default()
+        };
+        let lanes = [
+            ProfileLane::Actions,
+            ProfileLane::ActionStages,
+            ProfileLane::Materialization,
+            ProfileLane::Cache,
+        ];
+        let mut span_id = 0;
+        for i in 0..1_100 {
+            for lane in lanes {
+                span_id += 1;
+                // Staggered ends, so a slice on a thread shared between lanes would spill.
+                let name = format!("{} {i}", lane.label());
+                builder.completed_spans.push(profile_span(
+                    span_id,
+                    0,
+                    &name,
+                    lane,
+                    i,
+                    1_000_000 + span_id as i64,
+                ));
+            }
+        }
+        let profile = profile_of(&builder);
+
+        let names = profile_thread_names(&profile);
+        for lane in lanes {
+            let prefix = format!("{} ", lane.label());
+            let rows = names
+                .iter()
+                .filter(|name| {
+                    name.strip_prefix(&prefix)
+                        .is_some_and(|n| n.parse::<u32>().is_ok())
+                })
+                .count();
+            assert_eq!(rows, 1_100, "{prefix}");
+        }
+        let sorted = profile["traceEvents"]
+            .as_array()
+            .expect("trace events")
+            .iter()
+            .filter(|event| event["name"] == "thread_sort_index")
+            .count();
+        assert_eq!(sorted, names.len());
+        // Lanes stay grouped for viewers that order threads by tid.
+        assert!(
+            profile_tid(&profile, "Buck2 actions 1099")
+                < profile_tid(&profile, "Buck2 action stages 0")
+        );
+        assert!(
+            profile_tid(&profile, "Buck2 materialization 1099")
+                < profile_tid(&profile, "Buck2 cache and remote 0")
+        );
+    }
+
+    #[test]
+    fn profile_child_leaves_its_parents_thread_when_it_does_not_nest() {
+        let mut builder = CommandProfileBuilder {
+            command_started_at_us: Some(0),
+            ..Default::default()
+        };
+        let stage = ProfileLane::ActionStages;
+        builder.completed_spans = vec![
+            profile_span(1, 0, "action", ProfileLane::Actions, 0, 10_000),
+            profile_span(2, 1, "request a", stage, 1_000, 2_000),
+            // Starts while its sibling is still running.
+            profile_span(3, 1, "request b", stage, 2_000, 2_000),
+            profile_span(4, 3, "request b retry", stage, 2_500, 500),
+            // A worker-clock phase that starts just before the client's request ends.
+            profile_span(5, 1, "execute remotely", stage, 2_900, 3_000),
+            profile_span(6, 1, "request c", stage, 6_000, 1_000),
+            // Skewed past the end of the action.
+            profile_span(7, 1, "late download", stage, 9_500, 1_000),
+        ];
+        let profile = profile_of(&builder);
+
+        let action = profile_tid(&profile, "action");
+        assert_eq!(profile_tid(&profile, "request a"), action);
+        assert_eq!(profile_tid(&profile, "request c"), action);
+        let request_b = profile_tid(&profile, "request b");
+        let execute = profile_tid(&profile, "execute remotely");
+        assert_ne!(request_b, action);
+        assert_eq!(profile_tid(&profile, "request b retry"), request_b);
+        assert_ne!(execute, action);
+        assert_ne!(execute, request_b);
+        assert_ne!(profile_tid(&profile, "late download"), action);
+        let names = profile_thread_names(&profile);
+        assert!(names.contains(&"Buck2 actions".to_owned()), "{names:?}");
+        assert!(
+            names.contains(&"Buck2 action stages 1".to_owned()),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn profile_critical_path_is_one_thread_with_a_zero_duration_entry() {
+        let entry = |offset_ns: u64, nanos: i32| buck2_data::CriticalPathEntry2 {
+            start_offset_ns: Some(offset_ns),
+            duration: Some(prost_types::Duration { seconds: 0, nanos }),
+            ..Default::default()
+        };
+        let mut builder = CommandProfileBuilder {
+            command_started_at_us: Some(0),
+            ..Default::default()
+        };
+        builder.completed_spans = vec![profile_span(1, 0, "action", ProfileLane::Actions, 0, 100)];
+        builder.critical_path = vec![
+            entry(0, 5_000),
+            entry(5_000, 0),
+            entry(5_200, 300),
+            entry(5_500, 10_000),
+            entry(40_000, 2_000),
+        ];
+        let profile = profile_of(&builder);
+
+        let names = profile_thread_names(&profile);
+        let critical = names
+            .iter()
+            .filter(|name| name.starts_with("Critical Path"))
+            .collect::<Vec<_>>();
+        assert_eq!(critical, vec!["Critical Path"]);
+        let slices = profile["traceEvents"]
+            .as_array()
+            .expect("trace events")
+            .iter()
+            .filter(|event| event["cat"] == "critical path component")
+            .map(|event| {
+                (
+                    event["tid"].as_i64().expect("tid"),
+                    event["ts"].as_i64().expect("ts"),
+                    event["dur"].as_i64().expect("dur"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let tid = slices[0].0;
+        assert_eq!(
+            slices,
+            vec![
+                (tid, 0, 5),
+                (tid, 5, 1),
+                (tid, 6, 1),
+                (tid, 7, 10),
+                (tid, 40, 2)
+            ]
+        );
     }
 
     fn progress_payload(events: &[bep::BuildEvent]) -> &bep::Progress {
