@@ -1804,6 +1804,10 @@ message CommandEnd {
 
 message BuildResult {
   bool build_completed = 1;
+  // The exit code and its name that the client will report, when the daemon
+  // can already tell (the build had errors, or nothing else can fail it).
+  optional uint32 exit_code = 2;
+  optional string exit_name = 3;
 }
 
 // Marks the exit of the `CommandCriticalStart` event, such that the command has

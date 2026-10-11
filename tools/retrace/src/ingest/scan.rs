@@ -3158,6 +3158,7 @@ mod tests {
         assert_eq!(command_end_outcome(&end), None);
         end.build_result = Some(buck2_data::BuildResult {
             build_completed: true,
+            ..Default::default()
         });
         end.is_success = false;
         assert_eq!(command_end_outcome(&end), Some(true));

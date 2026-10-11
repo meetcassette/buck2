@@ -19,9 +19,7 @@ use std::process::Command;
 use buck2_data::ErrorReport;
 use buck2_error::ErrorTag;
 use buck2_error::ExitCode;
-use buck2_error::classify::ErrorLike;
-use buck2_error::classify::ErrorTagExtra;
-use buck2_error::classify::best_error;
+use buck2_error::classify::exit_code_for_errors;
 use buck2_error::conversion::from_any_with_tag;
 use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
@@ -203,9 +201,7 @@ impl ExitResult {
                 emitted_errors: errors,
             }
         }
-        let exit_code = best_error(&errors)
-            .and_then(|e| e.best_tag())
-            .map_or(ExitCode::UnknownFailure, |t| t.exit_code());
+        let exit_code = exit_code_for_errors(&errors);
         status_with_error_report(exit_code, errors)
     }
 

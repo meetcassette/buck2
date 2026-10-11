@@ -1563,8 +1563,9 @@ impl InvocationRecorder {
             buck2_data::command_end::Data::Build(..)
             | buck2_data::command_end::Data::Test(..)
             | buck2_data::command_end::Data::Install(..) => {
-                let build_completed = if let Some(buck2_data::BuildResult { build_completed }) =
-                    command.build_result
+                let build_completed = if let Some(buck2_data::BuildResult {
+                    build_completed, ..
+                }) = command.build_result
                 {
                     build_completed
                 } else {

@@ -590,6 +590,7 @@ pub fn demo_log_with(dir: &Path, o: DemoOpts) -> PathBuf {
                 buck2_data::span_end_event::Data::Command(buck2_data::CommandEnd {
                     build_result: Some(buck2_data::BuildResult {
                         build_completed: true,
+                        ..Default::default()
                     }),
                     data: Some(buck2_data::command_end::Data::Build(
                         buck2_data::BuildCommandEnd {
@@ -917,6 +918,7 @@ pub fn cache_hit_log(dir: &Path) -> PathBuf {
             buck2_data::span_end_event::Data::Command(buck2_data::CommandEnd {
                 build_result: Some(buck2_data::BuildResult {
                     build_completed: true,
+                    ..Default::default()
                 }),
                 data: Some(buck2_data::command_end::Data::Build(Default::default())),
                 ..Default::default()
@@ -1245,6 +1247,7 @@ pub fn cached_execution_log(
             buck2_data::span_end_event::Data::Command(buck2_data::CommandEnd {
                 build_result: Some(buck2_data::BuildResult {
                     build_completed: true,
+                    ..Default::default()
                 }),
                 data: Some(buck2_data::command_end::Data::Build(Default::default())),
                 ..Default::default()
@@ -1518,6 +1521,7 @@ pub fn reorder_log(dir: &Path) -> PathBuf {
             buck2_data::span_end_event::Data::Command(buck2_data::CommandEnd {
                 build_result: Some(buck2_data::BuildResult {
                     build_completed: true,
+                    ..Default::default()
                 }),
                 data: Some(buck2_data::command_end::Data::Build(Default::default())),
                 ..Default::default()

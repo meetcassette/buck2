@@ -62,6 +62,8 @@ use buck2_data::BuildResult;
 use buck2_data::ToProtoMessage;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
+use buck2_error::ExitCode;
+use buck2_error::classify::exit_code_for_errors;
 use buck2_error::internal_error;
 use buck2_events::dispatch::console_message;
 use buck2_events::dispatch::instant_event;
@@ -140,8 +142,15 @@ impl ServerCommandTemplate for BuildServerCommand {
     }
 
     fn build_result(&self, response: &Self::Response) -> Option<BuildResult> {
+        let exit_code = if response.errors.is_empty() {
+            ExitCode::Success
+        } else {
+            exit_code_for_errors(&response.errors)
+        };
         Some(BuildResult {
             build_completed: response.errors.is_empty(),
+            exit_code: Some(exit_code.exit_code()),
+            exit_name: Some(exit_code.name().to_owned()),
         })
     }
 }

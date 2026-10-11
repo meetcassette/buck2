@@ -75,6 +75,7 @@ use buck2_data::BuildResult;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
 use buck2_error::ErrorTag;
+use buck2_error::classify::exit_code_for_errors;
 use buck2_events::dispatch::console_message;
 use buck2_events::dispatch::instant_event;
 use buck2_events::dispatch::with_dispatcher_async;
@@ -336,8 +337,13 @@ impl ServerCommandTemplate for TestServerCommand {
     type PartialResult = NoPartialResult;
 
     fn build_result(&self, response: &Self::Response) -> Option<BuildResult> {
+        // Without build errors the test results decide the exit code, and the client works that out.
+        let exit_code = (!response.build_errors.is_empty())
+            .then(|| exit_code_for_errors(&response.build_errors));
         Some(BuildResult {
             build_completed: response.build_errors.is_empty(),
+            exit_code: exit_code.map(|code| code.exit_code()),
+            exit_name: exit_code.map(|code| code.name().to_owned()),
         })
     }
 

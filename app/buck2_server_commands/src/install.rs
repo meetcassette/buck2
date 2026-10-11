@@ -207,6 +207,7 @@ impl ServerCommandTemplate for InstallServerCommand {
         // TODO report this correctly
         Some(BuildResult {
             build_completed: true,
+            ..Default::default()
         })
     }
 }
