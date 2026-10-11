@@ -564,6 +564,15 @@ pub fn best_error<'a>(
     tags.into_iter().min_by_key(|e| e.error_rank())
 }
 
+/// The exit code of a command that finished with these errors.
+pub fn exit_code_for_errors<'a>(
+    errors: impl IntoIterator<Item = &'a buck2_data::ErrorReport>,
+) -> ExitCode {
+    best_error(errors)
+        .and_then(|e| e.best_tag())
+        .map_or(ExitCode::UnknownFailure, |t| t.exit_code())
+}
+
 /// Pick the most interesting tag from a list of tags.
 pub fn best_tag(tags: impl IntoIterator<Item = ErrorTag>) -> Option<ErrorTag> {
     tags.into_iter().min_by_key(|t| tag_rank(*t))

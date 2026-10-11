@@ -2895,19 +2895,13 @@ impl CommandProfileBuilder {
             .command_name
             .clone()
             .unwrap_or_else(|| command_end_name(command).to_owned());
+        let (exit_code, _) = command_end_exit(command);
         let mut args = serde_json::Map::new();
         args.insert(
             "outcome".to_owned(),
-            serde_json::json!(if command.is_success {
-                "success"
-            } else {
-                "failed"
-            }),
+            serde_json::json!(if exit_code == 0 { "success" } else { "failed" }),
         );
-        args.insert(
-            "exit_code".to_owned(),
-            serde_json::json!(if command.is_success { 0 } else { 1 }),
-        );
+        args.insert("exit_code".to_owned(), serde_json::json!(exit_code));
         args.insert(
             "trace_id".to_owned(),
             serde_json::json!(event.trace_id.as_str()),
@@ -5402,12 +5396,9 @@ fn profile_span_end_args(
     let mut args = serde_json::Map::new();
     match data {
         buck2_data::span_end_event::Data::Command(command) => {
-            json_arg_bool(&mut args, "success", command.is_success);
-            json_arg_i64(
-                &mut args,
-                "exit_code",
-                if command.is_success { 0 } else { 1 },
-            );
+            let (exit_code, _) = command_end_exit(command);
+            json_arg_bool(&mut args, "success", exit_code == 0);
+            json_arg_i64(&mut args, "exit_code", i64::from(exit_code));
         }
         buck2_data::span_end_event::Data::ActionExecution(action) => {
             json_arg_bool(&mut args, "failed", action.failed);
@@ -6386,12 +6377,8 @@ fn build_tool_logs_event_from_command_end(
     profile: &CommandProfileBuilder,
 ) -> bep::BuildEvent {
     let command_name = command_end_name(command);
-    let outcome = if command.is_success {
-        "success"
-    } else {
-        "failed"
-    };
-    let exit_code = if command.is_success { 0 } else { 1 };
+    let (exit_code, _) = command_end_exit(command);
+    let outcome = if exit_code == 0 { "success" } else { "failed" };
     let duration_ms = optional_duration_millis(span_end.duration.as_ref());
     let summary = serde_json::json!({
         "tool": BUILD_TOOL_VERSION,
@@ -7065,15 +7052,33 @@ fn finished_event_from_invocation_record(
     )
 }
 
+/// The exit code and name the client reports for this command, as far as the daemon knows them.
+fn command_end_exit(command: &buck2_data::CommandEnd) -> (i32, String) {
+    let build_result = command.build_result.as_ref();
+    if !command.is_success {
+        return (1, "FAILED".to_owned());
+    }
+    if let Some(exit_code) = build_result.and_then(|result| result.exit_code) {
+        let exit_code = i32::try_from(exit_code).unwrap_or(i32::MAX);
+        let fallback = if exit_code == 0 { "SUCCESS" } else { "FAILED" };
+        let exit_name = build_result
+            .and_then(|result| result.exit_name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| fallback.to_owned());
+        return (exit_code, exit_name);
+    }
+    // `is_success` only says the command returned a response; failed actions travel inside it.
+    if build_result.is_some_and(|result| !result.build_completed) {
+        return (1, "FAILED".to_owned());
+    }
+    (0, "SUCCESS".to_owned())
+}
+
 fn finished_event_from_command_end(
     event: &buck2_data::BuckEvent,
     command: &buck2_data::CommandEnd,
 ) -> bep::BuildEvent {
-    let (exit_code, exit_name) = if command.is_success {
-        (0, "SUCCESS")
-    } else {
-        (1, "FAILED")
-    };
+    let (exit_code, exit_name) = command_end_exit(command);
 
     finished_event(
         event.timestamp.clone(),
@@ -9733,6 +9738,7 @@ mod tests {
                             is_success: true,
                             build_result: Some(buck2_data::BuildResult {
                                 build_completed: true,
+                                ..Default::default()
                             }),
                         },
                     )),
@@ -10410,6 +10416,7 @@ mod tests {
                             is_success: true,
                             build_result: Some(buck2_data::BuildResult {
                                 build_completed: true,
+                                ..Default::default()
                             }),
                         },
                     )),
@@ -10761,6 +10768,7 @@ mod tests {
                             is_success: true,
                             build_result: Some(buck2_data::BuildResult {
                                 build_completed: true,
+                                ..Default::default()
                             }),
                         },
                     )),
@@ -10849,6 +10857,7 @@ mod tests {
                             is_success: true,
                             build_result: Some(buck2_data::BuildResult {
                                 build_completed: true,
+                                ..Default::default()
                             }),
                         },
                     )),
@@ -11175,6 +11184,7 @@ mod tests {
                             is_success: true,
                             build_result: Some(buck2_data::BuildResult {
                                 build_completed: true,
+                                ..Default::default()
                             }),
                         },
                     )),
@@ -11918,6 +11928,71 @@ mod tests {
         assert_eq!(action_data[1].last_ended_ms, 1040);
     }
 
+    fn build_finished_for(build_result: Option<buck2_data::BuildResult>) -> bep::BuildFinished {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::Command(
+                        buck2_data::CommandEnd {
+                            data: Some(buck2_data::command_end::Data::Build(
+                                buck2_data::BuildCommandEnd::default(),
+                            )),
+                            // What the daemon sends whenever the command returned a response.
+                            is_success: true,
+                            build_result,
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+        events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::Finished(finished)) => Some(finished.clone()),
+                _ => None,
+            })
+            .expect("build finished event")
+    }
+
+    #[test]
+    fn command_end_with_failed_actions_is_not_a_successful_build() {
+        let finished = build_finished_for(Some(buck2_data::BuildResult {
+            build_completed: false,
+            exit_code: Some(3),
+            exit_name: Some("USER_ERROR".to_owned()),
+        }));
+        assert!(!finished.overall_success);
+        let exit_code = finished.exit_code.as_ref().expect("exit code");
+        assert_eq!((exit_code.code, exit_code.name.as_str()), (3, "USER_ERROR"));
+        assert!(finished.failure_detail.is_some());
+
+        // A daemon that does not say which exit code still reports the failure.
+        let finished = build_finished_for(Some(buck2_data::BuildResult {
+            build_completed: false,
+            ..Default::default()
+        }));
+        assert!(!finished.overall_success);
+        let exit_code = finished.exit_code.as_ref().expect("exit code");
+        assert_eq!((exit_code.code, exit_code.name.as_str()), (1, "FAILED"));
+
+        for build_result in [
+            None,
+            Some(buck2_data::BuildResult {
+                build_completed: true,
+                exit_code: Some(0),
+                exit_name: Some("SUCCESS".to_owned()),
+            }),
+        ] {
+            let finished = build_finished_for(build_result);
+            assert!(finished.overall_success);
+            let exit_code = finished.exit_code.as_ref().expect("exit code");
+            assert_eq!((exit_code.code, exit_code.name.as_str()), (0, "SUCCESS"));
+        }
+    }
+
     #[test]
     fn command_end_emits_build_finished() {
         let mut converter = BazelEventConverter::default();
@@ -11933,6 +12008,7 @@ mod tests {
                             is_success: false,
                             build_result: Some(buck2_data::BuildResult {
                                 build_completed: true,
+                                ..Default::default()
                             }),
                         },
                     )),
@@ -12043,6 +12119,7 @@ mod tests {
                             is_success: false,
                             build_result: Some(buck2_data::BuildResult {
                                 build_completed: true,
+                                ..Default::default()
                             }),
                         },
                     )),
