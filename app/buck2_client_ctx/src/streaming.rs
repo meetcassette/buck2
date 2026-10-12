@@ -64,7 +64,10 @@ fn update_events_ctx<T: StreamingCommand>(
     let expect_spans = cmd.should_expect_spans();
 
     let paths = ctx.paths().ok();
-    let bes_results_url = remote_sink_config::bes_results_url(paths);
+    let bes_results_url = cmd
+        .publishes_events()
+        .then(|| remote_sink_config::bes_results_url(paths))
+        .flatten();
 
     // Need this to get information from one subscriber (event_log)
     // and log it in another (invocation_recorder)
@@ -211,6 +214,11 @@ pub trait StreamingCommand: Sized + Send + Sync {
     /// In the simple console, we want to display a "Waiting for daemon..." message
     /// exclusively for these commands whenever there are long periods without spans.
     fn should_expect_spans(&self) -> bool {
+        true
+    }
+
+    /// False for commands the daemon keeps out of BES (`lsp`, `starlark ...`): there is no build URL to show.
+    fn publishes_events(&self) -> bool {
         true
     }
 

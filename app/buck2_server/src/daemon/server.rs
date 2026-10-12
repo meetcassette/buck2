@@ -577,7 +577,9 @@ impl BuckdServer {
 
             let daemon_state = self.0.daemon_state.dupe();
             let trace_id = client_ctx.trace_id.parse()?;
-            let (events, dispatch) = daemon_state.prepare_events(trace_id).await?;
+            let (events, dispatch) = daemon_state
+                .prepare_events(trace_id, command.publishes_events())
+                .await?;
             let dispatch = dispatch.with_soft_error_context(soft_error_context);
             let ActiveCommand {
                 guard,
@@ -1532,7 +1534,7 @@ impl DaemonApi for BuckdServer {
     ) -> Result<Response<ResponseStream>, Status> {
         self.run_streaming(
             req,
-            DefaultCommandOptions,
+            EditorCommandOptions,
             |ctx, partial_result_dispatcher, req| {
                 Box::pin(async {
                     STARLARK_SERVER_COMMAND
@@ -1689,7 +1691,8 @@ impl DaemonApi for BuckdServer {
                 .trace_id
                 .parse()
                 .map_err(buck2_error::Error::from)?;
-            let (event_source, dispatcher) = self.0.daemon_state.prepare_events(trace_id).await?;
+            let (event_source, dispatcher) =
+                self.0.daemon_state.prepare_events(trace_id, true).await?;
             let dispatcher = dispatcher.with_soft_error_context(soft_error_context);
             let active_command = ActiveCommand::new(&dispatcher, client_ctx.sanitized_argv.clone());
             let tenant = self
@@ -1951,6 +1954,11 @@ trait StreamingCommandOptions<Req>: OneshotCommandOptions {
     fn prevents_background_cleanup(&self) -> bool {
         true
     }
+
+    /// Whether the command's events also go to the remote sink (BES), where each command is an invocation.
+    fn publishes_events(&self) -> bool {
+        true
+    }
 }
 
 /// A streaming command with its request, result and partial result types erased.
@@ -1969,6 +1977,8 @@ trait ErasedStreamingCommand: Send + 'static {
     fn triggers_idle_page_out(&self) -> bool;
 
     fn prevents_background_cleanup(&self) -> bool;
+
+    fn publishes_events(&self) -> bool;
 
     fn starlark_profiler_configuration(
         &self,
@@ -2024,6 +2034,10 @@ where
 
     fn prevents_background_cleanup(&self) -> bool {
         self.opts.prevents_background_cleanup()
+    }
+
+    fn publishes_events(&self) -> bool {
+        self.opts.publishes_events()
     }
 
     fn starlark_profiler_configuration(
@@ -2275,6 +2289,18 @@ impl<Req> StreamingCommandOptions<Req> for CleanStaleCommandOptions {
     }
 }
 
+/// Options for `starlark ...`: an editor runs them on every save, and none of them is a build anyone
+/// looks up later, so they stay out of the remote sink. `lsp` and `dap` opt out in their own options.
+struct EditorCommandOptions;
+
+impl OneshotCommandOptions for EditorCommandOptions {}
+
+impl<Req> StreamingCommandOptions<Req> for EditorCommandOptions {
+    fn publishes_events(&self) -> bool {
+        false
+    }
+}
+
 /// Options for `debug hydration`. Its subcommands manage the idle page-out
 /// directly (see `hydration_command`), so starting one must not cancel it.
 struct HydrationCommandOptions;
@@ -2316,6 +2342,10 @@ impl<Req> StreamingCommandOptions<Req> for LspCommandOptions {
     fn prevents_background_cleanup(&self) -> bool {
         false
     }
+
+    fn publishes_events(&self) -> bool {
+        false
+    }
 }
 
 /// Options for `dap`, long lived in the same way as `lsp` (see `LspCommandOptions`).
@@ -2325,6 +2355,10 @@ impl OneshotCommandOptions for DapCommandOptions {}
 
 impl<Req> StreamingCommandOptions<Req> for DapCommandOptions {
     fn prevents_background_cleanup(&self) -> bool {
+        false
+    }
+
+    fn publishes_events(&self) -> bool {
         false
     }
 }

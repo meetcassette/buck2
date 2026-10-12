@@ -123,6 +123,10 @@ impl StreamingCommand for StarlarkSubcommand {
     fn starlark_opts(&self) -> &CommonStarlarkOptions {
         &self.as_client_subcommand().common_opts().starlark_opts
     }
+
+    fn publishes_events(&self) -> bool {
+        false
+    }
 }
 
 impl StarlarkCommand {
