@@ -25,6 +25,7 @@ struct BuckconfigBesSettings {
     upload_successful_action_events: Option<bool>,
     bazel_artifact_upload_backend: Option<String>,
     re_client_cas_address: Option<String>,
+    re_client_http_headers: Vec<String>,
     bazel_artifact_upload_instance_name: Option<String>,
     re_client_instance_name: Option<String>,
     bazel_artifact_uri_authority: Option<String>,
@@ -62,6 +63,7 @@ pub fn with_buckconfig_overrides(
             if let Some(re_client_cas_address) = settings.re_client_cas_address {
                 config.re_client_cas_address = Some(re_client_cas_address);
             }
+            config.re_client_http_headers = settings.re_client_http_headers;
             if let Some(instance_name) = settings.bazel_artifact_upload_instance_name {
                 config.bazel_artifact_upload_instance_name = Some(instance_name);
             }
@@ -130,6 +132,7 @@ fn read_buckconfig_bes_settings(
             upload_successful_action_events: None,
             bazel_artifact_upload_backend: None,
             re_client_cas_address: None,
+            re_client_http_headers: Vec::new(),
             bazel_artifact_upload_instance_name: None,
             re_client_instance_name: None,
             bazel_artifact_uri_authority: None,
@@ -206,6 +209,12 @@ fn read_buckconfig_bes_settings(
             .filter(|s| !s.is_empty())
             .map(str::to_owned),
         re_client_cas_address,
+        re_client_http_headers: root_config
+            .parse_list::<String>(BuckconfigKeyRef {
+                section: "buck2_re_client",
+                property: "http_headers",
+            })?
+            .unwrap_or_default(),
         bazel_artifact_upload_instance_name: root_config
             .get(BuckconfigKeyRef {
                 section: "bes",

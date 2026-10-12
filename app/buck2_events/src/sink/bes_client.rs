@@ -84,6 +84,8 @@ pub struct BesConfig {
     pub upload_successful_action_events: bool,
     pub bazel_artifact_upload_backend: Option<String>,
     pub re_client_cas_address: Option<String>,
+    /// Raw `[buck2_re_client] http_headers` entries (`Name: Value`), sent on uploads that go to `cas_address`.
+    pub re_client_http_headers: Vec<String>,
     pub bazel_artifact_upload_instance_name: Option<String>,
     pub re_client_instance_name: Option<String>,
     pub bazel_artifact_uri_authority: Option<String>,
@@ -114,6 +116,7 @@ impl Default for BesConfig {
             upload_successful_action_events: true,
             bazel_artifact_upload_backend: None,
             re_client_cas_address: None,
+            re_client_http_headers: Vec::new(),
             bazel_artifact_upload_instance_name: None,
             re_client_instance_name: None,
             bazel_artifact_uri_authority: None,
@@ -275,7 +278,12 @@ struct BazelArtifactUploadConfig {
     grpc_timeout: Duration,
     upload_local_outputs: bool,
     backoff: UploadBackoff,
+    last_rejection: LastUploadRejection,
 }
+
+/// Uploads run after the client has its result and stopped reading the daemon's stderr, so the worker
+/// repeats the warning when the next command starts.
+type LastUploadRejection = Arc<std::sync::Mutex<Option<String>>>;
 
 /// Shared by all streams of a BES worker, so an unreachable upload server costs one connect timeout, not one per file.
 #[derive(Clone, Debug, Default)]
@@ -309,17 +317,31 @@ impl BazelArtifactUploadConfig {
         if config.event_format != BesEventFormat::Bazel || !config.bazel_artifact_upload {
             return Ok(None);
         }
-        let endpoint = config
+        let backend = config
             .bazel_artifact_upload_backend
             .as_deref()
             .map(|backend| bes_backend(Some(backend)))
-            .transpose()?
-            .or_else(|| {
-                config
-                    .re_client_cas_address
-                    .as_deref()
-                    .and_then(re_client_cas_endpoint)
-            })
+            .transpose()?;
+        let cas = match backend {
+            Some(_) => None,
+            None => config
+                .re_client_cas_address
+                .as_deref()
+                .and_then(re_client_cas_endpoint),
+        };
+        let mut headers = connection.headers.clone();
+        if let Some(cas) = &cas {
+            match re_client_headers(&config.re_client_http_headers, |v| std::env::var(v).ok()) {
+                Ok(re_headers) => headers.extend(re_headers),
+                Err(e) => tracing::warn!(
+                    "BES artifact upload to `{}` goes without `[buck2_re_client] http_headers`: {}",
+                    cas,
+                    e
+                ),
+            }
+        }
+        let endpoint = backend
+            .or(cas)
             .unwrap_or_else(|| connection.endpoint.clone());
         let uri_authority = config
             .bazel_artifact_uri_authority
@@ -334,7 +356,7 @@ impl BazelArtifactUploadConfig {
         }
         Ok(Some(Self {
             endpoint,
-            headers: connection.headers.clone(),
+            headers,
             instance_name: config
                 .bazel_artifact_upload_instance_name
                 .clone()
@@ -345,6 +367,7 @@ impl BazelArtifactUploadConfig {
             grpc_timeout: config.grpc_timeout,
             upload_local_outputs: config.bazel_artifact_upload_local_outputs,
             backoff: UploadBackoff::default(),
+            last_rejection: LastUploadRejection::default(),
         }))
     }
 }
@@ -354,6 +377,7 @@ struct BazelArtifactUploader {
     client: Option<ByteStreamClient<Channel>>,
     repo_path: Option<PathBuf>,
     directory_outputs: HashSet<BepFileIdentity>,
+    warned_upload_rejected: bool,
     #[cfg(test)]
     test_writes: Vec<WriteRequest>,
 }
@@ -384,6 +408,7 @@ impl BazelArtifactUploader {
             client: None,
             repo_path: None,
             directory_outputs: HashSet::new(),
+            warned_upload_rejected: false,
             #[cfg(test)]
             test_writes: Vec::new(),
         }
@@ -607,6 +632,10 @@ impl BazelArtifactUploader {
         let result = self.write_request(request).await;
         let response = self.note_failure(result)?;
         if response.committed_size != size && response.committed_size != -1 {
+            self.warn_upload_rejected(&format!(
+                "committed {} of {} bytes",
+                response.committed_size, size
+            ));
             return None;
         }
         let uri = bytestream_uri(
@@ -624,6 +653,10 @@ impl BazelArtifactUploader {
         let result = self.write_file_requests(resource_name, path, size).await;
         let response = self.note_failure(result)?;
         if response.committed_size != size && response.committed_size != -1 {
+            self.warn_upload_rejected(&format!(
+                "committed {} of {} bytes",
+                response.committed_size, size
+            ));
             return None;
         }
         let uri = bytestream_uri(
@@ -645,10 +678,35 @@ impl BazelArtifactUploader {
                 ) {
                     self.client = None;
                     self.config.backoff.trip(&self.config.endpoint, &status);
+                } else {
+                    self.warn_upload_rejected(&format!(
+                        "{:?}: {}",
+                        status.code(),
+                        status.message()
+                    ));
                 }
                 None
             }
         }
+    }
+
+    /// Once per command: every upload of the command fails the same way, and nothing else reports it.
+    fn warn_upload_rejected(&mut self, reason: &str) {
+        if std::mem::replace(&mut self.warned_upload_rejected, true) {
+            return;
+        }
+        let rejection = format!(
+            "BES artifact upload to `{}` was rejected ({})",
+            self.config.endpoint, reason
+        );
+        tracing::warn!(
+            "{rejection}; the profile and logs of this command stay inline, which bb-portal ignores"
+        );
+        *self
+            .config
+            .last_rejection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(rejection);
     }
 
     async fn write_request(
@@ -857,6 +915,43 @@ fn endpoint_authority(endpoint: &str) -> Option<String> {
         .map(str::trim)
         .filter(|authority| !authority.is_empty())
         .map(str::to_owned)
+}
+
+/// `[buck2_re_client] http_headers` as the RE client sends them: `Name: Value`, `$VAR` replaced from the environment.
+fn re_client_headers(
+    raw: &[String],
+    getenv: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<(String, String)>, String> {
+    let substitute = |s: &str| -> Result<String, String> {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(at) = rest.find('$') {
+            let name = &rest[at + 1..];
+            let len = name
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(name.len());
+            out.push_str(&rest[..at]);
+            if len == 0 || name.starts_with(|c: char| c.is_ascii_digit()) {
+                out.push('$');
+                rest = name;
+                continue;
+            }
+            out.push_str(
+                &getenv(&name[..len]).ok_or_else(|| format!("${} is not set", &name[..len]))?,
+            );
+            rest = &name[len..];
+        }
+        out.push_str(rest);
+        Ok(out)
+    };
+    raw.iter()
+        .map(|header| {
+            let (key, value) = header
+                .split_once(':')
+                .ok_or_else(|| "an entry has no `:` between name and value".to_owned())?;
+            Ok((substitute(key.trim())?, substitute(value.trim())?))
+        })
+        .collect()
 }
 
 fn re_client_cas_endpoint(address: &str) -> Option<String> {
@@ -1189,6 +1284,7 @@ struct WorkerState {
     counters: Arc<CounterState>,
     streams: HashMap<String, StreamState>,
     upload_backoff: UploadBackoff,
+    last_upload_rejection: LastUploadRejection,
 }
 
 impl WorkerState {
@@ -1199,6 +1295,7 @@ impl WorkerState {
             counters,
             streams: HashMap::new(),
             upload_backoff: UploadBackoff::default(),
+            last_upload_rejection: LastUploadRejection::default(),
         }
     }
 
@@ -1332,8 +1429,19 @@ impl WorkerState {
         let upload_config = BazelArtifactUploadConfig::from_bes(&self.config, &self.connection)?
             .map(|config| BazelArtifactUploadConfig {
                 backoff: self.upload_backoff.clone(),
+                last_rejection: self.last_upload_rejection.clone(),
                 ..config
             });
+        let previous = self
+            .last_upload_rejection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(rejection) = previous {
+            tracing::warn!(
+                "In the previous command: {rejection}; bb-portal has no profile or logs for it"
+            );
+        }
         let stream = StreamState::new(
             parsed,
             &self.config.build_metadata,
@@ -2197,6 +2305,7 @@ mod tests {
             grpc_timeout: Duration::from_secs(1),
             upload_local_outputs: true,
             backoff: UploadBackoff::default(),
+            last_rejection: LastUploadRejection::default(),
         }
     }
 
@@ -2828,6 +2937,192 @@ mod tests {
                 .get(&parsed.invocation_id)
                 .and_then(|stream| stream.pending_close.as_ref())
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn re_client_headers_substitute_env_like_the_re_client() {
+        let getenv = |v: &str| (v == "KEY").then(|| "sekrit".to_owned());
+        assert_eq!(
+            re_client_headers(
+                &[
+                    "Authorization: Bearer $KEY".to_owned(),
+                    "x-cost: 5$ $1 a$KEY.b".to_owned()
+                ],
+                getenv
+            ),
+            Ok(vec![
+                ("Authorization".to_owned(), "Bearer sekrit".to_owned()),
+                ("x-cost".to_owned(), "5$ $1 asekrit.b".to_owned()),
+            ])
+        );
+        assert_eq!(
+            re_client_headers(&["Authorization: Bearer $KEY$OTHER".to_owned()], getenv),
+            Err("$OTHER is not set".to_owned())
+        );
+        assert!(re_client_headers(&["no separator".to_owned()], getenv).is_err());
+    }
+
+    #[test]
+    fn re_client_headers_go_to_the_cas_and_not_to_the_bes_stream_or_another_backend() {
+        let connection = ConnectionConfig {
+            endpoint: "http://bes:8082".to_owned(),
+            headers: vec![("x-bes".to_owned(), "1".to_owned())],
+        };
+        let config = BesConfig {
+            event_format: BesEventFormat::Bazel,
+            re_client_cas_address: Some("grpc://cas:8980".to_owned()),
+            re_client_http_headers: vec!["Authorization: Bearer key".to_owned()],
+            ..BesConfig::default()
+        };
+        let upload = BazelArtifactUploadConfig::from_bes(&config, &connection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(upload.endpoint, "http://cas:8980");
+        assert_eq!(
+            upload.headers,
+            vec![
+                ("x-bes".to_owned(), "1".to_owned()),
+                ("Authorization".to_owned(), "Bearer key".to_owned()),
+            ]
+        );
+        assert_eq!(connection.headers.len(), 1);
+
+        let config = BesConfig {
+            bazel_artifact_upload_backend: Some("grpc://other:1".to_owned()),
+            ..config
+        };
+        let upload = BazelArtifactUploadConfig::from_bes(&config, &connection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(upload.endpoint, "http://other:1");
+        assert_eq!(upload.headers, connection.headers);
+    }
+
+    /// A CAS that records the `authorization` of each Write and accepts only `Bearer key`.
+    struct KeyedByteStream(Arc<std::sync::Mutex<Vec<Option<String>>>>);
+
+    #[tonic::async_trait]
+    impl google_grpc_proto::google::bytestream::byte_stream_server::ByteStream for KeyedByteStream {
+        type ReadStream = tokio_stream::Empty<
+            Result<google_grpc_proto::google::bytestream::ReadResponse, Status>,
+        >;
+
+        async fn read(
+            &self,
+            _request: tonic::Request<google_grpc_proto::google::bytestream::ReadRequest>,
+        ) -> Result<tonic::Response<Self::ReadStream>, Status> {
+            Err(Status::unimplemented("read"))
+        }
+
+        async fn write(
+            &self,
+            request: tonic::Request<tonic::Streaming<WriteRequest>>,
+        ) -> Result<tonic::Response<google_grpc_proto::google::bytestream::WriteResponse>, Status>
+        {
+            let key = request
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            self.0.lock().unwrap().push(key.clone());
+            if key.as_deref() != Some("Bearer key") {
+                return Err(Status::unauthenticated("no api key"));
+            }
+            let mut committed_size = 0;
+            let mut stream = request.into_inner();
+            while let Some(chunk) = stream.message().await? {
+                committed_size += chunk.data.len() as i64;
+            }
+            Ok(tonic::Response::new(
+                google_grpc_proto::google::bytestream::WriteResponse { committed_size },
+            ))
+        }
+
+        async fn query_write_status(
+            &self,
+            _request: tonic::Request<
+                google_grpc_proto::google::bytestream::QueryWriteStatusRequest,
+            >,
+        ) -> Result<
+            tonic::Response<google_grpc_proto::google::bytestream::QueryWriteStatusResponse>,
+            Status,
+        > {
+            Err(Status::unimplemented("query_write_status"))
+        }
+    }
+
+    async fn uploader_for_keyed_cas(
+        http_headers: Vec<String>,
+    ) -> (
+        BazelArtifactUploader,
+        Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ) {
+        use google_grpc_proto::google::bytestream::byte_stream_server::ByteStreamServer;
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ByteStreamServer::new(KeyedByteStream(seen.clone())))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let config = BesConfig {
+            event_format: BesEventFormat::Bazel,
+            re_client_cas_address: Some(format!("grpc://{address}")),
+            re_client_http_headers: http_headers,
+            ..BesConfig::default()
+        };
+        let connection = ConnectionConfig {
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            headers: Vec::new(),
+        };
+        let upload = BazelArtifactUploadConfig::from_bes(&config, &connection)
+            .unwrap()
+            .unwrap();
+        (BazelArtifactUploader::new(upload), seen)
+    }
+
+    #[tokio::test]
+    async fn cas_write_carries_the_re_client_header() {
+        let (mut uploader, seen) =
+            uploader_for_keyed_cas(vec!["Authorization: Bearer key".to_owned()]).await;
+        let mut event = build_tool_logs_event(b"profile");
+
+        uploader.upload_event_files(&mut event).await;
+
+        assert_eq!(*seen.lock().unwrap(), vec![Some("Bearer key".to_owned())]);
+        assert!(matches!(
+            build_tool_log(&event).file,
+            Some(bazel_bep_proto::build_event_stream::file::File::Uri(_))
+        ));
+        assert!(!uploader.warned_upload_rejected);
+    }
+
+    #[tokio::test]
+    async fn refused_cas_write_is_warned_about_and_does_not_trip_the_backoff() {
+        let (mut uploader, seen) = uploader_for_keyed_cas(Vec::new()).await;
+        let mut event = build_tool_logs_event(b"profile");
+
+        uploader.upload_event_files(&mut event).await;
+
+        assert_eq!(*seen.lock().unwrap(), vec![None]);
+        assert!(matches!(
+            build_tool_log(&event).file,
+            Some(bazel_bep_proto::build_event_stream::file::File::Contents(_))
+        ));
+        assert!(uploader.warned_upload_rejected);
+        assert!(!uploader.config.backoff.active());
+        let endpoint = &uploader.config.endpoint;
+        assert_eq!(
+            uploader.config.last_rejection.lock().unwrap().as_deref(),
+            Some(
+                format!(
+                    "BES artifact upload to `{endpoint}` was rejected (Unauthenticated: no api key)"
+                )
+                .as_str()
+            )
         );
     }
 }
