@@ -422,6 +422,13 @@ impl DaemonState {
                 })?
                 .or(re_client_default_address);
             #[cfg(not(fbcode_build))]
+            let re_client_http_headers = root_config
+                .parse_list::<String>(BuckconfigKeyRef {
+                    section: "buck2_re_client",
+                    property: "http_headers",
+                })?
+                .unwrap_or_default();
+            #[cfg(not(fbcode_build))]
             let re_client_instance_name = root_config.parse(BuckconfigKeyRef {
                 section: "buck2_re_client",
                 property: "instance_name",
@@ -509,6 +516,8 @@ impl DaemonState {
                     bazel_artifact_upload_backend,
                     #[cfg(not(fbcode_build))]
                     re_client_cas_address,
+                    #[cfg(not(fbcode_build))]
+                    re_client_http_headers,
                     #[cfg(not(fbcode_build))]
                     bazel_artifact_upload_instance_name,
                     #[cfg(not(fbcode_build))]

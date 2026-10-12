@@ -64,6 +64,8 @@ impl BuildGraphStats {
                 #[cfg(not(fbcode_build))]
                 re_client_cas_address: None,
                 #[cfg(not(fbcode_build))]
+                re_client_http_headers: Vec::new(),
+                #[cfg(not(fbcode_build))]
                 bazel_artifact_upload_instance_name: None,
                 #[cfg(not(fbcode_build))]
                 re_client_instance_name: None,
