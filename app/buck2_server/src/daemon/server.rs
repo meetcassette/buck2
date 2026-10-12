@@ -504,7 +504,9 @@ impl BuckdServer {
 
         let daemon_state = self.0.daemon_state.dupe();
         let trace_id = client_ctx.trace_id.parse()?;
-        let (events, dispatch) = daemon_state.prepare_events(trace_id).await?;
+        let (events, dispatch) = daemon_state
+            .prepare_events(trace_id, opts.publishes_events())
+            .await?;
         let ActiveCommand {
             guard,
             daemon_shutdown_channel,
@@ -1374,7 +1376,7 @@ impl DaemonApi for BuckdServer {
     ) -> Result<Response<ResponseStream>, Status> {
         self.run_streaming(
             req,
-            DefaultCommandOptions,
+            EditorCommandOptions,
             |ctx, partial_result_dispatcher, req| {
                 Box::pin(async {
                     STARLARK_SERVER_COMMAND
@@ -1522,7 +1524,8 @@ impl DaemonApi for BuckdServer {
                 .trace_id
                 .parse()
                 .map_err(buck2_error::Error::from)?;
-            let (event_source, dispatcher) = self.0.daemon_state.prepare_events(trace_id).await?;
+            let (event_source, dispatcher) =
+                self.0.daemon_state.prepare_events(trace_id, true).await?;
             let active_command = ActiveCommand::new(&dispatcher, client_ctx.sanitized_argv.clone());
             (event_source, dispatcher, active_command)
         };
@@ -1647,7 +1650,7 @@ impl DaemonApi for BuckdServer {
     ) -> Result<Response<Self::LspStream>, Status> {
         self.run_bidirectional(
             req,
-            DefaultCommandOptions,
+            EditorCommandOptions,
             |ctx,
              partial_result_dispatcher,
              _client_ctx,
@@ -1683,7 +1686,7 @@ impl DaemonApi for BuckdServer {
     ) -> Result<Response<Self::DapStream>, Status> {
         self.run_bidirectional(
             req,
-            DefaultCommandOptions,
+            EditorCommandOptions,
             |ctx,
              partial_result_dispatcher,
              _client_ctx,
@@ -1762,6 +1765,11 @@ trait StreamingCommandOptions<Req>: OneshotCommandOptions {
     /// read-only / non-graph commands (see `NonPagingCommandOptions`,
     /// `HydrationCommandOptions`), which neither cancel nor trigger.
     fn triggers_idle_page_out(&self) -> bool {
+        true
+    }
+
+    /// Whether the command's events also go to the remote sink (BES), where each command is an invocation.
+    fn publishes_events(&self) -> bool {
         true
     }
 }
@@ -1902,6 +1910,18 @@ struct DefaultCommandOptions;
 impl OneshotCommandOptions for DefaultCommandOptions {}
 
 impl<Req> StreamingCommandOptions<Req> for DefaultCommandOptions {}
+
+/// Options for `lsp` and `starlark ...`: an editor runs them on every save, and none of them is a build
+/// anyone looks up later, so they stay out of the remote sink.
+struct EditorCommandOptions;
+
+impl OneshotCommandOptions for EditorCommandOptions {}
+
+impl<Req> StreamingCommandOptions<Req> for EditorCommandOptions {
+    fn publishes_events(&self) -> bool {
+        false
+    }
+}
 
 /// Options for `debug hydration`. Its subcommands manage the idle page-out
 /// directly (see `hydration_command`), so starting one must not cancel it.

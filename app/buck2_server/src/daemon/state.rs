@@ -1065,12 +1065,13 @@ impl DaemonState {
     pub async fn prepare_events(
         &self,
         trace_id: TraceId,
+        publish: bool,
     ) -> buck2_error::Result<(ChannelEventSource, EventDispatcher)> {
         // facebook only: logging events to Scribe.
         facebook_only();
         let (events, sink) = buck2_events::create_source_sink_pair();
         let data = self.data();
-        let dispatcher = if let Some(scribe_sink) = data.scribe_sink.dupe() {
+        let dispatcher = if let Some(scribe_sink) = data.scribe_sink.dupe().filter(|_| publish) {
             EventDispatcher::new(
                 trace_id,
                 self.data.daemon_id.dupe(),
