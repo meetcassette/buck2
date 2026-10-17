@@ -18,6 +18,8 @@ import "host_sharing.proto";
 
 package buck.data;
 
+// Fork-only fields added to upstream-owned messages use numbers 200000-262143, so a field upstream adds later cannot take the same number.
+
 // A single event originating from Buck. Its semantics depend on the `data`
 // member.
 message BuckEvent {
@@ -1560,8 +1562,9 @@ message BuildResult {
   bool build_completed = 1;
   // The exit code and its name that the client will report, when the daemon
   // can already tell (the build had errors, or nothing else can fail it).
-  optional uint32 exit_code = 2;
-  optional string exit_name = 3;
+  // Fork-only fields, in the fork-owned range (see the note at the top).
+  optional uint32 exit_code = 200000;
+  optional string exit_name = 200001;
 }
 
 // Marks the exit of the `CommandCriticalStart` event, such that the command has
