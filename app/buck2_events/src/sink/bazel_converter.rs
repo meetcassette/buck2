@@ -12021,6 +12021,43 @@ mod tests {
     }
 
     #[test]
+    fn build_result_exit_code_uses_fork_field_numbers() {
+        use prost::encoding::WireType;
+        use prost::encoding::encode_key;
+        use prost::encoding::encode_varint;
+
+        fn fields(exit_code: u32, exit_name: u32) -> Vec<u8> {
+            let mut buf = Vec::new();
+            encode_key(exit_code, WireType::Varint, &mut buf);
+            encode_varint(3, &mut buf);
+            encode_key(exit_name, WireType::LengthDelimited, &mut buf);
+            encode_varint(10, &mut buf);
+            buf.extend_from_slice(b"USER_ERROR");
+            buf
+        }
+
+        let build_result = buck2_data::BuildResult {
+            build_completed: false,
+            exit_code: Some(3),
+            exit_name: Some("USER_ERROR".to_owned()),
+        };
+        assert_eq!(build_result.encode_to_vec(), fields(200000, 200001));
+        let finished = build_finished_for(Some(
+            buck2_data::BuildResult::decode(fields(200000, 200001).as_slice()).unwrap(),
+        ));
+        let exit_code = finished.exit_code.as_ref().expect("exit code");
+        assert_eq!((exit_code.code, exit_code.name.as_str()), (3, "USER_ERROR"));
+
+        // A log written when these were fields 2 and 3 loses the exit code but still reads as failed.
+        let old = buck2_data::BuildResult::decode(fields(2, 3).as_slice()).unwrap();
+        assert_eq!((old.exit_code, old.exit_name.as_deref()), (None, None));
+        let finished = build_finished_for(Some(old));
+        assert!(!finished.overall_success);
+        let exit_code = finished.exit_code.as_ref().expect("exit code");
+        assert_eq!((exit_code.code, exit_code.name.as_str()), (1, "FAILED"));
+    }
+
+    #[test]
     fn command_end_emits_build_finished() {
         let mut converter = BazelEventConverter::default();
         let events = converter.convert(
