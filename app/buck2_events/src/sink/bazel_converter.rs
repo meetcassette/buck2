@@ -12058,6 +12058,153 @@ mod tests {
     }
 
     #[test]
+    fn mercury_fields_use_fork_field_numbers() {
+        use prost::encoding::WireType;
+        use prost::encoding::encode_key;
+        use prost::encoding::encode_varint;
+
+        fn field(tag: u32, wire_type: WireType, payload: &[u8]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            encode_key(tag, wire_type, &mut buf);
+            if wire_type == WireType::LengthDelimited {
+                encode_varint(payload.len() as u64, &mut buf);
+            }
+            buf.extend_from_slice(payload);
+            buf
+        }
+        fn bytes(tag: u32, payload: &[u8]) -> Vec<u8> {
+            field(tag, WireType::LengthDelimited, payload)
+        }
+        fn varint(tag: u32, value: u64) -> Vec<u8> {
+            let mut payload = Vec::new();
+            encode_varint(value, &mut payload);
+            field(tag, WireType::Varint, &payload)
+        }
+        // An event as a log holds it, with the payload's field numbers spelled out.
+        fn raw_event(tag: u32, payload: &[u8]) -> buck2_data::BuckEvent {
+            let mut buf = buck2_data::BuckEvent {
+                data: None,
+                ..trace_event(buck2_data::buck_event::Data::Instant(Default::default()))
+            }
+            .encode_to_vec();
+            buf.extend(bytes(tag, payload));
+            buck2_data::BuckEvent::decode(buf.as_slice()).unwrap()
+        }
+        let exec_requests = |event: &buck2_data::BuckEvent| {
+            BazelEventConverter::default()
+                .convert(1, event)
+                .into_iter()
+                .filter_map(|event| match event.payload {
+                    Some(build_event::Payload::ExecRequest(request)) => Some(request.argv),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // InstantEvent.run_exec_request, through the converter.
+        let request = [bytes(2, b"app"), varint(5, 1)].concat();
+        let instant = buck2_data::InstantEvent {
+            data: Some(buck2_data::instant_event::Data::RunExecRequest(
+                buck2_data::RunExecRequest {
+                    argv: vec!["app".to_owned()],
+                    should_exec: true,
+                    ..Default::default()
+                },
+            )),
+        };
+        assert_eq!(instant.encode_to_vec(), bytes(200004, &request));
+        let event = raw_event(22, &bytes(200004, &request));
+        assert_eq!(
+            event.data,
+            Some(buck2_data::buck_event::Data::Instant(instant))
+        );
+        assert_eq!(exec_requests(&event), vec![vec![b"app".to_vec()]]);
+
+        // SpanStartEvent.remote_request.
+        let remote_request = bytes(1, b"cas");
+        let span_start = buck2_data::SpanStartEvent {
+            data: Some(buck2_data::span_start_event::Data::RemoteRequest(
+                buck2_data::RemoteRequestStart {
+                    service: "cas".to_owned(),
+                    ..Default::default()
+                },
+            )),
+        };
+        assert_eq!(span_start.encode_to_vec(), bytes(200002, &remote_request));
+
+        // ActionOutput, where only tiny_digest is upstream's.
+        let action_output = |tags: [u32; 4]| {
+            [
+                bytes(1, b"t"),
+                bytes(tags[0], b"p"),
+                bytes(tags[1], b"d"),
+                varint(tags[2], 7),
+                varint(tags[3], 1),
+            ]
+            .concat()
+        };
+        let output = buck2_data::ActionOutput {
+            tiny_digest: "t".to_owned(),
+            path: "p".to_owned(),
+            digest: "d".to_owned(),
+            size: 7,
+            is_directory: true,
+        };
+        assert_eq!(
+            output.encode_to_vec(),
+            action_output([200008, 200009, 200010, 200011])
+        );
+
+        // MaterializationEnd.url.
+        let materialization = buck2_data::MaterializationEnd {
+            url: Some("https://example.com/a".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            materialization.encode_to_vec(),
+            bytes(200017, b"https://example.com/a")
+        );
+
+        // A log written with the old numbers loses these fields, and the converter still accepts its events.
+        // Upstream has since taken two of those numbers, InstantEvent 64 and span 91, so those read as its events.
+        let old = raw_event(22, &bytes(64, &request));
+        assert_eq!(
+            old.data,
+            Some(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::ActionGraphStart(
+                        Default::default()
+                    )),
+                }
+            ))
+        );
+        assert_eq!(exec_requests(&old), Vec::<Vec<Vec<u8>>>::new());
+        let old = raw_event(20, &bytes(91, &remote_request));
+        assert_eq!(
+            old.data,
+            Some(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::ReSubmit(
+                        buck2_data::ReSubmitStart {}
+                    )),
+                }
+            ))
+        );
+        exec_requests(&old);
+        let old = buck2_data::ActionOutput::decode(action_output([2, 3, 4, 5]).as_slice()).unwrap();
+        assert_eq!(
+            old,
+            buck2_data::ActionOutput {
+                tiny_digest: "t".to_owned(),
+                ..Default::default()
+            }
+        );
+        let old =
+            buck2_data::MaterializationEnd::decode(bytes(8, b"https://example.com/a").as_slice());
+        assert_eq!(old.unwrap().url, None);
+    }
+
+    #[test]
     fn command_end_emits_build_finished() {
         let mut converter = BazelEventConverter::default();
         let events = converter.convert(
