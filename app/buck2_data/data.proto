@@ -19,6 +19,7 @@ import "host_sharing.proto";
 package buck.data;
 
 // Fork-only fields added to upstream-owned messages use numbers 200000-262143, so a field upstream adds later cannot take the same number.
+// Each takes the next unused number across the whole file; the highest so far is 200017 (MaterializationEnd.url).
 
 // A single event originating from Buck. Its semantics depend on the `data`
 // member.
@@ -93,7 +94,7 @@ message SpanStartEvent {
     DepFileUploadStart dep_file_upload = 88;
     ComputeDetailedAggregatedMetricsStart compute_detailed_aggregated_metrics =
         89;
-    RemoteRequestStart remote_request = 91;
+    RemoteRequestStart remote_request = 200002; // Fork-only.
     // Used in Buck unit tests.
     FakeStart fake = 999;
   }
@@ -147,7 +148,7 @@ message SpanEndEvent {
     DepFileUploadEnd dep_file_upload = 88;
     ComputeDetailedAggregatedMetricsEnd compute_detailed_aggregated_metrics =
         89;
-    RemoteRequestEnd remote_request = 91;
+    RemoteRequestEnd remote_request = 200003; // Fork-only.
     // Used in Buck unit tests.
     FakeEnd fake = 999;
   }
@@ -379,12 +380,12 @@ message InstantEvent {
 
     // The final request constructed by a successful `buck2 run` build before
     // the client executes, prints, or writes the requested command line.
-    // Forward-port note: Mercury used 60; newer base reserves 60, so use 64.
-    RunExecRequest run_exec_request = 64;
+    // Fork-only, as is external_resource_fetch.
+    RunExecRequest run_exec_request = 200004;
 
     // A non-action external resource fetch, such as a git-backed external
     // cell population.
-    ExternalResourceFetch external_resource_fetch = 61;
+    ExternalResourceFetch external_resource_fetch = 200005;
 
     PageOutSummary page_out_summary = 62;
 
@@ -1402,7 +1403,7 @@ message TestSuite {
   string suite_name = 1;
   repeated string test_names = 2;
   ConfiguredTargetLabel target_label = 3;
-  repeated string labels = 4;
+  repeated string labels = 200006; // Fork-only.
 }
 
 // An event that marks the beginning of a command.
@@ -1880,8 +1881,8 @@ message CommandExecutionMetadata {
   /// resource control was not enabled.
   optional uint64 suspend_count = 11;
 
-  /// Worker-side timing metadata reported by remote execution.
-  RemoteExecutionTiming remote_execution_timing = 12;
+  /// Worker-side timing metadata reported by remote execution. Fork-only.
+  RemoteExecutionTiming remote_execution_timing = 200007;
 }
 
 message RemoteExecutionTiming {
@@ -1955,10 +1956,11 @@ message CommandExecutionError {}
 
 message ActionOutput {
   string tiny_digest = 1;
-  string path = 2;
-  string digest = 3;
-  uint64 size = 4;
-  bool is_directory = 5;
+  // Fork-only fields.
+  string path = 200008;
+  string digest = 200009;
+  uint64 size = 200010;
+  bool is_directory = 200011;
 }
 
 message ActionExecutionEnd {
@@ -2446,7 +2448,7 @@ message ReLogStreamAvailable {
   string stderr_stream_name = 3;
   optional string action_key = 4;
   string use_case = 5;
-  ActionKey key = 6;
+  ActionKey key = 200012; // Fork-only.
 }
 
 message LocalStage {
@@ -2503,7 +2505,7 @@ message TestDiscoveryStart {
   // Trying to find the test suite(s) associated with this binary.
   string suite_name = 1;
   ConfiguredTargetLabel target_label = 2;
-  repeated string labels = 3;
+  repeated string labels = 200013; // Fork-only.
 }
 
 message TestDiscoveryEnd {
@@ -2513,7 +2515,7 @@ message TestDiscoveryEnd {
   optional buck.host_sharing.HostSharingRequirements
       command_host_sharing_requirements = 4;
   ConfiguredTargetLabel target_label = 5;
-  repeated string labels = 6;
+  repeated string labels = 200014; // Fork-only.
 }
 
 message TestRunStart {
@@ -2525,7 +2527,7 @@ message TestRunEnd {
   CommandExecution command_report = 2;
   optional buck.host_sharing.HostSharingRequirements
       command_host_sharing_requirements = 3;
-  google.protobuf.Duration timeout = 4;
+  google.protobuf.Duration timeout = 200015; // Fork-only.
 }
 
 message FileWatcherStart {
@@ -3359,7 +3361,7 @@ message OutputSymlink {
 
 message CreateOutputSymlinksEnd {
   uint64 created = 1;
-  repeated OutputSymlink symlinks = 2;
+  repeated OutputSymlink symlinks = 200016; // Fork-only.
 };
 
 message InstallEventInfoStart {
@@ -3401,8 +3403,8 @@ message MaterializationEnd {
 
   // The type of entry that was materialized
   optional MaterializationMethod method = 7;
-  // The URL fetched for HTTP downloads.
-  optional string url = 8;
+  // The URL fetched for HTTP downloads. Fork-only.
+  optional string url = 200017;
 };
 
 message ExclusiveCommandWaitStart {
